@@ -1,0 +1,46 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  LogLM Configuration — copy to .env and fill in values
+# ══════════════════════════════════════════════════════════════════════════════
+
+POSTGRES_PASSWORD=change_me_strong_password
+SECRET_KEY=change_me_random_32_chars
+
+# ── Discord ──────────────────────────────────────────────────────────────────
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+
+# ── Ollama LLM ───────────────────────────────────────────────────────────────
+# For local Docker Ollama (NVIDIA GPU):
+#   OLLAMA_URL=http://ollama:11434
+# For host-native Ollama (Mac / external server):
+#   OLLAMA_URL=http://host.docker.internal:11434
+# For a remote Ollama instance:
+#   OLLAMA_URL=http://192.168.1.50:11434
+OLLAMA_URL=http://host.docker.internal:11434
+
+# Model selection:
+#   Mac M4 (recommended):     llama3.2:3b       (~2 GB, fast on Metal)
+#   NVIDIA 8 GB (default):    llama3.1:8b-instruct-q4_K_M  (~4.7 GB VRAM)
+#   Lighter NVIDIA option:    mistral:7b-instruct-q4_K_M   (~4.1 GB VRAM)
+OLLAMA_MODEL=llama3.2:3b
+
+# ── Web UI ───────────────────────────────────────────────────────────────────
+WEB_PORT=8080
+
+# ── LibreNMS integration (optional) ──────────────────────────────────────────
+LIBRENMS_URL=
+LIBRENMS_TOKEN=
+
+# ── SNMP polling ─────────────────────────────────────────────────────────────
+# Comma-separated targets: host:port or just host (default port 161)
+# Example: 192.168.1.1,192.168.1.2:161,unifi-ap-office
+SNMP_TARGETS=
+SNMP_COMMUNITY=public
+SNMP_POLL_INTERVAL=60
+
+# ── Tuning ───────────────────────────────────────────────────────────────────
+# Alert de-duplication cooldown per service (seconds)
+ALERT_COOLDOWN_SECONDS=300
+# How often the analyzer checks for anomalies (seconds)
+ANALYSIS_INTERVAL_SECONDS=60
+# How often the memory summariser runs (seconds)
+MEMORY_INTERVAL_SECONDS=300
