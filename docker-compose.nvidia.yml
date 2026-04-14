@@ -1,0 +1,38 @@
+# NVIDIA GPU override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: loglm-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - loglm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        sleep 5
+        ollama pull $${OLLAMA_MODEL:-llama3.1:8b-instruct-q4_K_M}
+        wait
+      "
+
+  analyzer:
+    depends_on:
+      ollama:
+        condition: service_started

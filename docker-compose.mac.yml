@@ -1,0 +1,36 @@
+# Apple Silicon (M1/M2/M3/M4) override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Runs Ollama natively on the Mac host (not in Docker) to leverage Metal/ANE.
+# Docker Desktop for Mac cannot pass GPU to containers, so Ollama must run on
+# the host where it can access Metal acceleration.
+#
+# Setup:
+#   1. Install Ollama on macOS:   brew install ollama
+#   2. Start Ollama:              ollama serve
+#   3. Pull model:                ollama pull llama3.2:3b
+#   4. Set OLLAMA_URL in .env:    OLLAMA_URL=http://host.docker.internal:11434
+#   5. Start LogLM:               docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+
+services:
+  # Override analyzer + web to point at host Ollama
+  analyzer:
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      # Smaller model for Mac — still excellent, fits easily in unified memory
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # SNMP: drop libsnmp-dev — use pure Python only on ARM
+  snmp:
+    build:
+      context: ./snmp
+      dockerfile: Dockerfile.arm

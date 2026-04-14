@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Aliases · LogLM{% endblock %}
+
+{% block content %}
+<h1>Service Aliases</h1>
+<p class="text-muted" style="margin-bottom:1.25rem;font-size:.875rem;">
+  Map raw hostnames or IP addresses (as they appear in logs) to friendly names.
+  Aliases are used in LLM prompts and alert messages.
+</p>
+
+<!-- Add form -->
+<div class="card" style="margin-bottom:1.25rem;">
+  <h2>Add / Update Alias</h2>
+  <form method="post" action="/aliases">
+    <div class="form-row">
+      <div class="form-group">
+        <label>Raw name (IP or hostname)</label>
+        <input type="text" name="raw_name" placeholder="192.168.1.1" required>
+      </div>
+      <div class="form-group">
+        <label>Alias</label>
+        <input type="text" name="alias" placeholder="Unifi Router" required>
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>Description (optional)</label>
+        <input type="text" name="description" placeholder="Main gateway">
+      </div>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</div>
+
+<!-- Alias table -->
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Raw Name</th>
+          <th>Alias</th>
+          <th>Description</th>
+          <th>Updated</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in aliases %}
+        <tr>
+          <td><code style="font-size:.8rem;color:var(--accent)">{{ a.raw_name }}</code></td>
+          <td><strong>{{ a.alias }}</strong></td>
+          <td class="text-muted">{{ a.description or '' }}</td>
+          <td class="text-muted" style="white-space:nowrap">{{ a.updated_at.strftime('%Y-%m-%d') }}</td>
+          <td>
+            <button class="btn danger" style="font-size:.7rem;padding:.2rem .5rem;"
+                    onclick="deleteAlias({{ a.id }}, this)">Delete</button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty-state">No aliases defined yet</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,8 @@
+# ARM-friendly SNMP Dockerfile — no native libsnmp (uses pure-Python pysnmp only)
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 162/udp
+CMD ["python", "-u", "main.py"]

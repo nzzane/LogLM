@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Logs · LogLM{% endblock %}
+
+{% block content %}
+<h1>Log Browser</h1>
+
+<form method="get" action="/logs">
+  <div class="form-row">
+    <div class="form-group">
+      <label>Host</label>
+      <input type="text" name="host" value="{{ host }}" placeholder="192.168.1.1">
+    </div>
+    <div class="form-group">
+      <label>Source</label>
+      <select name="source">
+        <option value="">All</option>
+        <option value="syslog"   {% if source=='syslog' %}selected{% endif %}>syslog</option>
+        <option value="nginx"    {% if source=='nginx' %}selected{% endif %}>nginx</option>
+        <option value="firewall" {% if source=='firewall' %}selected{% endif %}>firewall</option>
+        <option value="sshd"     {% if source=='sshd' %}selected{% endif %}>sshd</option>
+        <option value="snmp"     {% if source=='snmp' %}selected{% endif %}>snmp</option>
+        <option value="librenms" {% if source=='librenms' %}selected{% endif %}>librenms</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Severity</label>
+      <select name="severity">
+        <option value="">All</option>
+        <option value="emerg"   {% if severity=='emerg' %}selected{% endif %}>emerg</option>
+        <option value="alert"   {% if severity=='alert' %}selected{% endif %}>alert</option>
+        <option value="crit"    {% if severity=='crit' %}selected{% endif %}>crit</option>
+        <option value="error"   {% if severity=='error' %}selected{% endif %}>error</option>
+        <option value="warning" {% if severity=='warning' %}selected{% endif %}>warning</option>
+        <option value="notice"  {% if severity=='notice' %}selected{% endif %}>notice</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Time window</label>
+      <select name="hours">
+        <option value="1"   {% if hours==1 %}selected{% endif %}>Last 1h</option>
+        <option value="6"   {% if hours==6 %}selected{% endif %}>Last 6h</option>
+        <option value="24"  {% if hours==24 %}selected{% endif %}>Last 24h</option>
+        <option value="168" {% if hours==168 %}selected{% endif %}>Last 7d</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Search</label>
+      <input type="search" name="q" value="{{ q }}" placeholder="keyword...">
+    </div>
+    <button type="submit">Filter</button>
+  </div>
+</form>
+
+<div class="card">
+  <div class="section-header" style="margin-bottom:.5rem;">
+    <span class="text-muted">{{ total }} events</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Host</th>
+          <th>Source</th>
+          <th>Severity</th>
+          <th>Program</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr>
+          <td style="white-space:nowrap">{{ e.timestamp.strftime('%m-%d %H:%M:%S') }}</td>
+          <td>{{ e.host }}</td>
+          <td>{{ e.source }}</td>
+          <td><span class="badge badge-{{ e.severity }}">{{ e.severity }}</span></td>
+          <td>{{ e.program or '' }}</td>
+          <td>{{ e.message[:300] }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty-state">No events match the current filters</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% set pages = (total // limit) + (1 if total % limit else 0) %}
+{% if pages > 1 %}
+<div class="pagination">
+  {% if page > 1 %}<a href="?host={{ host }}&source={{ source }}&severity={{ severity }}&q={{ q }}&hours={{ hours }}&page={{ page-1 }}">‹ Prev</a>{% endif %}
+  {% for p in range(1, pages+1) %}
+    {% if p == page %}<span class="current">{{ p }}</span>
+    {% elif p <= 3 or p >= pages-1 or (p >= page-1 and p <= page+1) %}
+      <a href="?host={{ host }}&source={{ source }}&severity={{ severity }}&q={{ q }}&hours={{ hours }}&page={{ p }}">{{ p }}</a>
+    {% elif p == 4 or p == pages-2 %}<span>…</span>
+    {% endif %}
+  {% endfor %}
+  {% if page < pages %}<a href="?host={{ host }}&source={{ source }}&severity={{ severity }}&q={{ q }}&hours={{ hours }}&page={{ page+1 }}">Next ›</a>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

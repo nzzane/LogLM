@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · LogLM{% endblock %}
+
+{% block content %}
+<h1>Dashboard</h1>
+
+<!-- Stat cards -->
+<div class="grid-3">
+  <div class="card stat-card">
+    <div class="stat-value" id="stat-events-1h">—</div>
+    <div class="stat-label">Events (1h)</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-value" id="stat-errors-24h">—</div>
+    <div class="stat-label">Errors (24h)</div>
+  </div>
+  <div class="card stat-card">
+    <div class="stat-value" id="stat-alerts-unacked">—</div>
+    <div class="stat-label">Unacknowledged Alerts</div>
+  </div>
+</div>
+
+<!-- Service status -->
+{% if services %}
+<div class="section-header">
+  <h2>Services</h2>
+  <a href="/aliases" class="btn secondary" style="font-size:.75rem;padding:.3rem .7rem;">Manage Aliases</a>
+</div>
+<div class="services-grid">
+  {% for svc in services %}
+  <div class="service-chip {{ svc.status }}">
+    <span class="service-name">{{ svc.alias or svc.service_name }}</span>
+    <span class="service-host">{{ svc.host }}</span>
+    <span class="badge badge-{{ svc.status }}">{{ svc.status }}</span>
+    {% if svc.last_event %}
+    <span class="service-last">{{ svc.last_event.strftime('%H:%M') }}</span>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="grid-2">
+  <!-- Recent alerts -->
+  <div>
+    <div class="section-header">
+      <h2>Recent Alerts</h2>
+      <a href="/alerts" class="text-muted" style="font-size:.75rem;">View all →</a>
+    </div>
+    {% if alerts %}
+      {% for alert in alerts %}
+      <div class="alert-card {{ alert.severity }} {% if alert.acknowledged %}acked{% endif %}">
+        <div class="alert-header">
+          <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
+          <span class="alert-title">{{ alert.title }}</span>
+          {% if not alert.acknowledged %}
+          <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
+                  onclick="ackAlert({{ alert.id }}, this)">Ack</button>
+          {% endif %}
+        </div>
+        <div class="alert-meta">
+          {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} UTC
+          {% if alert.affected_hosts %}· {{ alert.affected_hosts | join(', ') }}{% endif %}
+        </div>
+        <div class="alert-desc">{{ alert.description }}</div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state">No alerts yet</div>
+    {% endif %}
+  </div>
+
+  <!-- Live event feed -->
+  <div>
+    <div class="section-header">
+      <h2>Live Feed</h2>
+      <span class="text-muted" style="font-size:.75rem;">security &amp; error events only</span>
+    </div>
+    <div id="live-feed">
+      {% for event in events %}
+      <div class="log-line">
+        <span class="log-ts">{{ event.timestamp.strftime('%H:%M:%S') }}</span>
+        <span class="log-host">{{ event.host }}</span>
+        <span class="badge badge-{{ event.severity }}">{{ event.severity }}</span>
+        <span class="log-msg">{{ event.message[:200] }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endblock %}
