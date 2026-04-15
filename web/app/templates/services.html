@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+{% block title %}Server Logs · LogLM{% endblock %}
+
+{% block content %}
+<h1>Server Logs</h1>
+
+{% if not docker_available %}
+<div class="card" style="border-color: var(--warn);">
+  <strong>Docker socket unavailable.</strong>
+  <p class="text-muted">Mount <code>/var/run/docker.sock</code> into the web container to enable live logs.</p>
+</div>
+{% endif %}
+
+<div class="services-layout">
+  <aside class="services-sidebar card">
+    <div class="section-header"><h2>Containers</h2></div>
+    <ul id="service-list" class="service-list">
+      {% for s in services %}
+      <li class="service-item" data-name="{{ s }}">
+        <span class="service-dot" data-status="unknown"></span>
+        <span class="service-name">{{ s }}</span>
+        <span class="service-state text-muted"></span>
+      </li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  <section class="services-main card">
+    <div class="section-header">
+      <h2 id="log-title">Select a service</h2>
+      <div class="log-controls">
+        <label>Tail
+          <select id="tail-size">
+            <option value="100">100</option>
+            <option value="200" selected>200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="group-toggle" checked> Group repeats</label>
+        <label><input type="checkbox" id="follow-toggle" checked> Follow</label>
+        <label><input type="checkbox" id="wrap-toggle"> Wrap</label>
+        <button id="clear-btn" type="button">Clear</button>
+      </div>
+    </div>
+    <div id="log-stats" class="text-muted" style="margin: 4px 0; font-size: 0.85em;"></div>
+    <pre id="log-view" class="log-view">Pick a container on the left.</pre>
+  </section>
+</div>
+
+<script>
+(function() {
+  const listEl = document.getElementById('service-list');
+  const viewEl = document.getElementById('log-view');
+  const titleEl = document.getElementById('log-title');
+  const tailEl = document.getElementById('tail-size');
+  const followEl = document.getElementById('follow-toggle');
+  const wrapEl = document.getElementById('wrap-toggle');
+  const groupEl = document.getElementById('group-toggle');
+  const statsEl = document.getElementById('log-stats');
+  const clearBtn = document.getElementById('clear-btn');
+
+  let currentName = null;
+  let eventSource = null;
+
+  // Live dedup state — same normalize regex as backend.
+  const NORMALIZE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?|\d{2}:\d{2}:\d{2}(?:\.\d+)?|0x[0-9a-fA-F]+|\b[0-9a-f]{12,}\b|\b\d+\b/g;
+  function normalize(line) { return line.replace(NORMALIZE, '#').trim(); }
+
+  let groups = [];           // array of {sample, count}
+  let sigIdx = new Map();    // sig → index into groups
+
+  function resetGroups() { groups = []; sigIdx = new Map(); }
+
+  function ingest(line) {
+    if (!line || !line.trim()) return;
+    const sig = normalize(line);
+    if (!sig) return;
+    if (sigIdx.has(sig)) {
+      groups[sigIdx.get(sig)].count++;
+    } else {
+      sigIdx.set(sig, groups.length);
+      groups.push({ sample: line, count: 1 });
+    }
+    // Cap memory.
+    if (groups.length > 2000) {
+      groups = groups.slice(-1500);
+      sigIdx = new Map(groups.map((g, i) => [normalize(g.sample), i]));
+    }
+  }
+
+  function render() {
+    if (!groupEl.checked) return;  // raw mode handled elsewhere
+    const lines = groups.map(g => g.count > 1
+      ? `(${g.count}\u00d7) ${g.sample}`
+      : g.sample);
+    const atBottom = viewEl.scrollTop + viewEl.clientHeight >= viewEl.scrollHeight - 20;
+    viewEl.textContent = lines.join('\n');
+    const total = groups.reduce((a, g) => a + g.count, 0);
+    statsEl.textContent = `${groups.length} unique / ${total} total`;
+    if (atBottom) viewEl.scrollTop = viewEl.scrollHeight;
+  }
+
+  function setDot(item, status) {
+    const dot = item.querySelector('.service-dot');
+    const state = item.querySelector('.service-state');
+    dot.dataset.status = status;
+    state.textContent = status;
+  }
+
+  async function refreshStatuses() {
+    try {
+      const r = await fetch('/api/services');
+      if (!r.ok) return;
+      const d = await r.json();
+      for (const s of d.services) {
+        const item = listEl.querySelector(`[data-name="${s.name}"]`);
+        if (!item) continue;
+        setDot(item, s.status);
+      }
+    } catch {}
+  }
+
+  function closeStream() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  }
+
+  function appendRaw(line) {
+    const atBottom = viewEl.scrollTop + viewEl.clientHeight >= viewEl.scrollHeight - 20;
+    viewEl.textContent += line + '\n';
+    const max = 5000;
+    const split = viewEl.textContent.split('\n');
+    if (split.length > max) viewEl.textContent = split.slice(split.length - max).join('\n');
+    if (atBottom) viewEl.scrollTop = viewEl.scrollHeight;
+  }
+
+  function appendLive(line) {
+    if (groupEl.checked) {
+      ingest(line);
+      render();
+    } else {
+      appendRaw(line);
+    }
+  }
+
+  async function loadTail(name) {
+    const tail = parseInt(tailEl.value, 10);
+    resetGroups();
+    statsEl.textContent = '';
+    try {
+      const r = await fetch(`/api/services/${encodeURIComponent(name)}/logs?tail=${tail}`);
+      if (!r.ok) { viewEl.textContent = `Error loading logs: HTTP ${r.status}`; return; }
+      const d = await r.json();
+      if (groupEl.checked && Array.isArray(d.groups)) {
+        groups = d.groups.map(g => ({ sample: g.sample, count: g.count }));
+        sigIdx = new Map(groups.map((g, i) => [normalize(g.sample), i]));
+        render();
+      } else {
+        viewEl.textContent = d.logs || '(no output)';
+        viewEl.scrollTop = viewEl.scrollHeight;
+        statsEl.textContent = `${d.raw_lines || 0} lines`;
+      }
+    } catch (e) {
+      viewEl.textContent = `Error: ${e}`;
+    }
+  }
+
+  function openStream(name) {
+    closeStream();
+    if (!followEl.checked) return;
+    eventSource = new EventSource(`/api/services/${encodeURIComponent(name)}/stream`);
+    eventSource.onmessage = (e) => {
+      try { appendLive(JSON.parse(e.data)); } catch {}
+    };
+    eventSource.onerror = () => closeStream();
+  }
+
+  async function selectService(name) {
+    if (currentName === name) return;
+    currentName = name;
+    closeStream();
+    listEl.querySelectorAll('.service-item').forEach(el => {
+      el.classList.toggle('selected', el.dataset.name === name);
+    });
+    titleEl.textContent = name;
+    viewEl.textContent = 'Loading...';
+    await loadTail(name);
+    openStream(name);
+  }
+
+  listEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.service-item');
+    if (!item) return;
+    selectService(item.dataset.name);
+  });
+
+  tailEl.addEventListener('change', () => {
+    if (currentName) loadTail(currentName).then(() => openStream(currentName));
+  });
+
+  groupEl.addEventListener('change', () => {
+    if (currentName) loadTail(currentName).then(() => openStream(currentName));
+  });
+
+  followEl.addEventListener('change', () => {
+    if (!currentName) return;
+    if (followEl.checked) openStream(currentName);
+    else closeStream();
+  });
+
+  wrapEl.addEventListener('change', () => {
+    viewEl.classList.toggle('wrap', wrapEl.checked);
+  });
+
+  clearBtn.addEventListener('click', () => {
+    resetGroups();
+    statsEl.textContent = '';
+    viewEl.textContent = '';
+  });
+
+  window.addEventListener('beforeunload', closeStream);
+
+  refreshStatuses();
+  setInterval(refreshStatuses, 10000);
+})();
+</script>
+{% endblock %}

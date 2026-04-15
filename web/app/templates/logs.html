@@ -65,20 +65,29 @@
           <th>Severity</th>
           <th>Program</th>
           <th>Message</th>
+          <th>Train</th>
         </tr>
       </thead>
       <tbody>
         {% for e in events %}
-        <tr>
+        <tr data-fb="1"
+            data-event-id="{{ e.id }}"
+            data-host="{{ e.host }}"
+            data-program="{{ e.program or '' }}"
+            data-pattern="{{ e.message[:200] }}">
           <td style="white-space:nowrap">{{ e.timestamp.strftime('%m-%d %H:%M:%S') }}</td>
           <td>{{ e.host }}</td>
           <td>{{ e.source }}</td>
           <td><span class="badge badge-{{ e.severity }}">{{ e.severity }}</span></td>
           <td>{{ e.program or '' }}</td>
           <td>{{ e.message[:300] }}</td>
+          <td class="fb-actions" style="white-space:nowrap">
+            <button class="fb-btn fb-imp" title="Mark important" onclick="fbFromButton(this,'important')">★</button>
+            <button class="fb-btn fb-ign" title="Ignore future" onclick="fbFromButton(this,'ignore')">✕</button>
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="empty-state">No events match the current filters</td></tr>
+        <tr><td colspan="7" class="empty-state">No events match the current filters</td></tr>
         {% endfor %}
       </tbody>
     </table>

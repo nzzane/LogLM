@@ -43,6 +43,10 @@ function appendLogLine(event) {
   if (!liveFeed) return;
   const line = document.createElement('div');
   line.className = 'log-line';
+  line.dataset.fb = '1';
+  line.dataset.host = event.host || '';
+  line.dataset.program = event.program || '';
+  line.dataset.pattern = (event.message || '').slice(0, 200);
   const ts = (event.timestamp || '').slice(11, 19);
   const host = event.host || '?';
   const msg = (event.message || '').slice(0, 200);
@@ -53,10 +57,13 @@ function appendLogLine(event) {
     <span class="log-host">${escHtml(host)}</span>
     <span class="badge badge-${sev}">${sev}</span>
     <span class="log-msg">${escHtml(msg)}</span>
+    <span class="fb-actions">
+      <button class="fb-btn fb-imp" title="Mark important" onclick="fbFromButton(this,'important')">★</button>
+      <button class="fb-btn fb-ign" title="Ignore future" onclick="fbFromButton(this,'ignore')">✕</button>
+    </span>
   `;
 
   liveFeed.prepend(line);
-  // Keep max 200 lines
   while (liveFeed.children.length > 200) {
     liveFeed.removeChild(liveFeed.lastChild);
   }
@@ -93,6 +100,44 @@ window.deleteAlias = async function(id, row) {
   if (r.ok) row.closest('tr').remove();
 };
 
+// ── Feedback (AI training: important / ignore) ────────────────────────────────
+window.sendFeedback = async function(btn, payload) {
+  btn.disabled = true;
+  const orig = btn.textContent;
+  try {
+    const r = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (r.ok) {
+      btn.textContent = payload.verdict === 'important' ? '★ saved' : '✕ saved';
+      btn.classList.add('fb-saved');
+      const sib = btn.parentElement.querySelectorAll('button');
+      sib.forEach(b => { if (b !== btn) b.disabled = true; });
+    } else {
+      btn.textContent = 'err';
+      btn.disabled = false;
+    }
+  } catch {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+};
+
+window.fbFromButton = function(btn, verdict) {
+  const wrap = btn.closest('[data-fb]');
+  if (!wrap) return;
+  const payload = {
+    verdict,
+    event_id: wrap.dataset.eventId ? parseInt(wrap.dataset.eventId, 10) : null,
+    host: wrap.dataset.host || null,
+    program: wrap.dataset.program || null,
+    pattern: wrap.dataset.pattern || null,
+  };
+  sendFeedback(btn, payload);
+};
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function escHtml(s) {
   return String(s)
@@ -111,3 +156,23 @@ setInterval(refreshStats, 30000);
 document.querySelectorAll('.nav-links a').forEach(a => {
   if (a.pathname === location.pathname) a.classList.add('active');
 });
+
+// ── Hover prefetch for nav links ──────────────────────────────────────────────
+// Warm browser cache the moment user hovers a nav link so click feels instant.
+(function() {
+  const prefetched = new Set();
+  function prefetch(url) {
+    if (prefetched.has(url)) return;
+    prefetched.add(url);
+    const link = document.createElement('link');
+    link.rel = 'prefetch';
+    link.href = url;
+    link.as = 'document';
+    document.head.appendChild(link);
+  }
+  document.querySelectorAll('.nav-links a').forEach(a => {
+    if (a.pathname === location.pathname) return;
+    a.addEventListener('mouseenter', () => prefetch(a.href), { once: true });
+    a.addEventListener('touchstart', () => prefetch(a.href), { once: true, passive: true });
+  });
+})();

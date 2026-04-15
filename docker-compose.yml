@@ -5,13 +5,12 @@ services:
     build: ./rsyslog
     container_name: loglm-syslog
     restart: unless-stopped
-    ports:
-      - "514:514/udp"
-      - "514:514/tcp"
     environment:
       REDIS_URL: redis://redis:6379
+      TZ: ${TZ:-UTC}
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.100
     depends_on:
       - redis
 
@@ -20,16 +19,16 @@ services:
     build: ./snmp
     container_name: loglm-snmp
     restart: unless-stopped
-    ports:
-      - "162:162/udp"
     environment:
       REDIS_URL: redis://redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       SNMP_TARGETS: ${SNMP_TARGETS:-}
       SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
       SNMP_POLL_INTERVAL: ${SNMP_POLL_INTERVAL:-60}
+      TZ: ${TZ:-UTC}
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.101
     depends_on:
       - redis
 
@@ -44,8 +43,14 @@ services:
       LOKI_URL: http://loki:3100
       LIBRENMS_URL: ${LIBRENMS_URL:-}
       LIBRENMS_TOKEN: ${LIBRENMS_TOKEN:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL_FAST: ${OLLAMA_MODEL_FAST:-llama3.2:1b}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      PROCESSOR_USE_FAST_LLM: ${PROCESSOR_USE_FAST_LLM:-0}
+      TZ: ${TZ:-UTC}
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.102
     depends_on:
       - redis
       - postgres
@@ -60,13 +65,17 @@ services:
       REDIS_URL: redis://redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
+      OLLAMA_MAX_CONCURRENT: ${OLLAMA_MAX_CONCURRENT:-2}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
       ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
       ANALYSIS_INTERVAL_SECONDS: ${ANALYSIS_INTERVAL_SECONDS:-60}
       MEMORY_INTERVAL_SECONDS: ${MEMORY_INTERVAL_SECONDS:-300}
+      TZ: ${TZ:-UTC}
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.103
     depends_on:
       - redis
       - postgres
@@ -76,17 +85,24 @@ services:
     build: ./web
     container_name: loglm-web
     restart: unless-stopped
-    ports:
-      - "${WEB_PORT:-8080}:8000"
     environment:
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       REDIS_URL: redis://redis:6379
       LOKI_URL: http://loki:3100
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
+      OLLAMA_MAX_CONCURRENT: ${OLLAMA_MAX_CONCURRENT:-2}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      LIBRENMS_URL: ${LIBRENMS_URL:-}
+      LIBRENMS_TOKEN: ${LIBRENMS_TOKEN:-}
       SECRET_KEY: ${SECRET_KEY:-changeme-in-production}
+      TZ: ${TZ:-UTC}
+      NTP_SERVER: ${NTP_SERVER:-pool.ntp.org}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.104
     depends_on:
       - postgres
       - redis
@@ -97,12 +113,16 @@ services:
     image: grafana/loki:2.9.8
     container_name: loglm-loki
     restart: unless-stopped
+    user: "0:0"
+    environment:
+      TZ: ${TZ:-UTC}
     volumes:
       - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
-      - loki_data:/loki
+      - ${STORAGE_PATH:-./data}/loki:/loki
     command: -config.file=/etc/loki/local-config.yaml
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.105
 
   # ── PostgreSQL (structured data) ─────────────────────────────────────────────
   postgres:
@@ -113,29 +133,30 @@ services:
       POSTGRES_USER: loglm
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: loglm
+      TZ: ${TZ:-UTC}
+      PGTZ: ${TZ:-UTC}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${STORAGE_PATH:-./data}/postgres:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.106
 
   # ── Redis (message queue / pub-sub) ─────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: loglm-redis
     restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
     volumes:
-      - redis_data:/data
+      - ${STORAGE_PATH:-./data}/redis:/data
     command: redis-server --save 60 1 --loglevel warning
     networks:
-      - loglm
-
-volumes:
-  ollama_models:
-  loki_data:
-  postgres_data:
-  redis_data:
+      br0:
+        ipv4_address: 10.20.10.107
 
 networks:
-  loglm:
-    driver: bridge
+  br0:
+    external: true
+    name: br0

@@ -13,19 +13,26 @@
 #   5. Start LogLM:               docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
 
 services:
-  # Override analyzer + web to point at host Ollama
+  # Override analyzer + web + processor to point at host Ollama
   analyzer:
     environment:
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      # Smaller model for Mac — still excellent, fits easily in unified memory
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.2:3b}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
   web:
     environment:
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.2:3b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  processor:
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL_FAST: ${OLLAMA_MODEL_FAST:-llama3.2:1b}
+      PROCESSOR_USE_FAST_LLM: ${PROCESSOR_USE_FAST_LLM:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

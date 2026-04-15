@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+{% block title %}Topology · LogLM{% endblock %}
+
+{% block content %}
+<h1>Topology</h1>
+<p class="text-muted">Drag nodes to arrange. Click a node to open its host page. Right-click a node to edit. Click two nodes to connect them.</p>
+
+<div class="topo-toolbar">
+  <button id="btn-add-node">Add node</button>
+  <button id="btn-link-mode" class="ghost">Link mode: off</button>
+  <button id="btn-physics" class="ghost">Physics: off</button>
+  <button id="btn-fit">Fit view</button>
+  <button id="btn-reload" class="ghost">Reload</button>
+  <span class="text-muted small" id="topo-status"></span>
+</div>
+
+<div id="topo-canvas" class="topo-canvas"></div>
+
+<div class="card" style="margin-top:1rem;">
+  <div class="section-header"><h2>Selection</h2></div>
+  <div id="selection-panel" class="text-muted">click a node or edge</div>
+</div>
+
+<link rel="stylesheet" href="https://unpkg.com/vis-network/styles/vis-network.min.css">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script>
+(function() {
+  const ICONS = {{ icons | tojson }};
+  const ICON_GLYPH = {
+    server:   '\u25A0',  // ■
+    router:   '\u25C6',  // ◆
+    switch:   '\u25BC',  // ▼
+    ap:       '\u25B2',  // ▲
+    firewall: '\u2716',  // ✖
+    cloud:    '\u2601',  // ☁
+    device:   '\u25CF',  // ●
+  };
+  const COLORS = {
+    server:   '#8b9dc3',
+    router:   '#7bbcd6',
+    switch:   '#9ec19e',
+    ap:       '#d4b16a',
+    firewall: '#d68a8a',
+    cloud:    '#b5b5b5',
+    device:   '#aaaaaa',
+  };
+
+  const canvas = document.getElementById('topo-canvas');
+  const status = document.getElementById('topo-status');
+  const selPanel = document.getElementById('selection-panel');
+  const btnLink = document.getElementById('btn-link-mode');
+  const btnPhys = document.getElementById('btn-physics');
+  const btnAdd = document.getElementById('btn-add-node');
+  const btnFit = document.getElementById('btn-fit');
+  const btnReload = document.getElementById('btn-reload');
+
+  let nodesDS = new vis.DataSet([]);
+  let edgesDS = new vis.DataSet([]);
+  let network = null;
+  let linkMode = false;
+  let physicsOn = false;
+  let pendingFromHost = null;  // first node clicked in link mode
+  let dragSaveTimer = null;
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+
+  function nodeForServer(n) {
+    const icon = (n.icon || 'server').toLowerCase();
+    const glyph = ICON_GLYPH[icon] || ICON_GLYPH.server;
+    return {
+      id: n.host,
+      label: `${glyph} ${n.label || n.host}`,
+      title: `${n.host}${n.notes ? ' \u2014 ' + n.notes : ''}`,
+      color: { background: n.color || COLORS[icon] || COLORS.server, border: '#333' },
+      font: { color: '#eee' },
+      shape: 'box',
+      x: n.x,
+      y: n.y,
+      fixed: !!n.pinned,
+      _icon: icon,
+      _auto: !!n.auto,
+      _notes: n.notes || '',
+    };
+  }
+
+  function edgeForServer(e) {
+    return {
+      id: e.id,
+      from: e.from_host,
+      to: e.to_host,
+      label: e.label || '',
+      color: { color: e.color || '#888' },
+      width: Math.max(1, Math.min(6, e.weight || 1)),
+      dashes: !!e.auto,
+      arrows: 'to',
+    };
+  }
+
+  async function loadTopology() {
+    status.textContent = 'loading...';
+    try {
+      const r = await fetch('/api/topology');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      nodesDS.clear();
+      edgesDS.clear();
+      nodesDS.add((d.nodes || []).map(nodeForServer));
+      edgesDS.add((d.edges || []).map(edgeForServer));
+      status.textContent = `${d.nodes.length} nodes, ${d.edges.length} edges`;
+      if (network) network.fit();
+    } catch (e) {
+      status.textContent = 'error: ' + e;
+    }
+  }
+
+  async function saveNode(host, patch) {
+    const body = Object.assign({host}, patch);
+    const r = await fetch('/api/topology/node', {
+      method: 'PUT', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  }
+
+  async function deleteNode(host) {
+    if (!confirm(`Delete ${host} from topology? (host data is preserved)`)) return;
+    const r = await fetch(`/api/topology/node/${encodeURIComponent(host)}`, {method: 'DELETE'});
+    if (!r.ok) { alert('delete failed'); return; }
+    nodesDS.remove(host);
+    edgesDS.forEach(e => { if (e.from === host || e.to === host) edgesDS.remove(e.id); });
+  }
+
+  async function createEdge(a, b) {
+    try {
+      const r = await fetch('/api/topology/edge', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({from_host: a, to_host: b}),
+      });
+      if (r.status === 409) { status.textContent = 'edge already exists'; return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      edgesDS.add(edgeForServer({id: d.id, from_host: a, to_host: b}));
+      status.textContent = `linked ${a} -> ${b}`;
+    } catch (e) { alert('link failed: ' + e); }
+  }
+
+  async function deleteEdge(id) {
+    if (!confirm('Delete this edge?')) return;
+    const r = await fetch(`/api/topology/edge/${id}`, {method: 'DELETE'});
+    if (!r.ok) { alert('delete failed'); return; }
+    edgesDS.remove(id);
+  }
+
+  function showSelection(params) {
+    if (params.nodes && params.nodes.length) {
+      const id = params.nodes[0];
+      const n = nodesDS.get(id);
+      selPanel.innerHTML = `
+        <div><strong>${escapeHtml(id)}</strong> ${n._auto ? '<span class="text-muted">(auto)</span>' : ''}</div>
+        <div class="form-row">
+          <label>Label <input id="sel-label" value="${escapeHtml((n.label||'').replace(/^.\u00a0?/, ''))}"></label>
+          <label>Icon
+            <select id="sel-icon">
+              ${ICONS.map(i => `<option value="${i}" ${i===n._icon?'selected':''}>${i}</option>`).join('')}
+            </select>
+          </label>
+          <label>Color <input id="sel-color" type="color" value="${(n.color && n.color.background) || '#8b9dc3'}"></label>
+          <label class="check"><input type="checkbox" id="sel-pinned" ${n.fixed?'checked':''}> pinned</label>
+        </div>
+        <div class="form-row">
+          <label style="flex:1;">Notes <input id="sel-notes" value="${escapeHtml(n._notes||'')}"></label>
+        </div>
+        <div class="row-end">
+          <a class="ghost" href="/host/${encodeURIComponent(id)}">Open host page</a>
+          <button id="sel-save">Save</button>
+          <button id="sel-delete" class="danger">Remove from map</button>
+        </div>
+      `;
+      document.getElementById('sel-save').addEventListener('click', async () => {
+        const newLabel = document.getElementById('sel-label').value;
+        const newIcon  = document.getElementById('sel-icon').value;
+        const newColor = document.getElementById('sel-color').value;
+        const newPinned = document.getElementById('sel-pinned').checked;
+        const newNotes  = document.getElementById('sel-notes').value;
+        try {
+          await saveNode(id, {label: newLabel, icon: newIcon, color: newColor,
+                              pinned: newPinned, notes: newNotes});
+          await loadTopology();
+        } catch (e) { alert('save failed: ' + e); }
+      });
+      document.getElementById('sel-delete').addEventListener('click', () => deleteNode(id));
+    } else if (params.edges && params.edges.length) {
+      const id = params.edges[0];
+      const e = edgesDS.get(id);
+      selPanel.innerHTML = `
+        <div><strong>${escapeHtml(e.from)}</strong> &rarr; <strong>${escapeHtml(e.to)}</strong></div>
+        ${e.dashes ? '<div class="text-muted small">auto-discovered</div>' : ''}
+        <div class="row-end"><button id="edge-delete" class="danger">Delete edge</button></div>
+      `;
+      document.getElementById('edge-delete').addEventListener('click', () => deleteEdge(id));
+    } else {
+      selPanel.innerHTML = '<span class="text-muted">click a node or edge</span>';
+    }
+  }
+
+  function init() {
+    network = new vis.Network(canvas, {nodes: nodesDS, edges: edgesDS}, {
+      physics: { enabled: false },
+      interaction: { hover: true, multiselect: false, dragNodes: true },
+      nodes: { borderWidth: 2 },
+      edges: { smooth: { type: 'continuous' } },
+    });
+
+    network.on('click', (params) => {
+      if (linkMode && params.nodes.length === 1) {
+        const id = params.nodes[0];
+        if (!pendingFromHost) {
+          pendingFromHost = id;
+          status.textContent = `link mode: from ${id} ... click another node`;
+          return;
+        }
+        if (pendingFromHost === id) {
+          pendingFromHost = null;
+          status.textContent = 'link mode: cancelled';
+          return;
+        }
+        createEdge(pendingFromHost, id);
+        pendingFromHost = null;
+        status.textContent = 'link mode: pick first node';
+        return;
+      }
+      showSelection(params);
+    });
+
+    network.on('doubleClick', (params) => {
+      if (params.nodes.length === 1) {
+        window.location.href = `/host/${encodeURIComponent(params.nodes[0])}`;
+      }
+    });
+
+    network.on('dragEnd', (params) => {
+      if (!params.nodes.length) return;
+      const positions = network.getPositions(params.nodes);
+      clearTimeout(dragSaveTimer);
+      dragSaveTimer = setTimeout(async () => {
+        for (const id of Object.keys(positions)) {
+          const p = positions[id];
+          try { await saveNode(id, {x: p.x, y: p.y}); }
+          catch (e) { console.warn('drag save failed', id, e); }
+        }
+        status.textContent = 'positions saved';
+      }, 250);
+    });
+
+    network.on('oncontext', (params) => {
+      params.event.preventDefault();
+      const id = network.getNodeAt(params.pointer.DOM);
+      if (id) { network.selectNodes([id]); showSelection({nodes:[id], edges:[]}); }
+    });
+  }
+
+  btnLink.addEventListener('click', () => {
+    linkMode = !linkMode;
+    pendingFromHost = null;
+    btnLink.textContent = `Link mode: ${linkMode ? 'on' : 'off'}`;
+    btnLink.classList.toggle('active', linkMode);
+    status.textContent = linkMode ? 'link mode: pick first node' : '';
+  });
+
+  btnPhys.addEventListener('click', () => {
+    physicsOn = !physicsOn;
+    btnPhys.textContent = `Physics: ${physicsOn ? 'on' : 'off'}`;
+    btnPhys.classList.toggle('active', physicsOn);
+    network.setOptions({ physics: { enabled: physicsOn } });
+  });
+
+  btnAdd.addEventListener('click', async () => {
+    const host = prompt('Host (IP or DNS name):');
+    if (!host) return;
+    try {
+      await saveNode(host.trim(), {icon: 'server'});
+      await loadTopology();
+    } catch (e) { alert('add failed: ' + e); }
+  });
+
+  btnFit.addEventListener('click', () => network && network.fit());
+  btnReload.addEventListener('click', loadTopology);
+
+  init();
+  loadTopology();
+})();
+</script>
+{% endblock %}

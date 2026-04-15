@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% block title %}Retention · LogLM{% endblock %}
+
+{% block content %}
+<h1>Retention &amp; system</h1>
+<p class="text-muted">
+  Each policy prunes one slice of one table on a daily schedule. The processor
+  service runs them hourly. Default tiers keep noise for 7 days, normal logs for
+  30 days, important events 90 days, alerts 1 year.
+</p>
+
+<div class="card">
+  <div class="section-header"><h2>Time &amp; NTP</h2></div>
+  <div class="kv-grid">
+    <div><span class="k">timezone</span><span class="v" id="sys-tz">...</span></div>
+    <div><span class="k">server time</span><span class="v" id="sys-time">...</span></div>
+    <div><span class="k">ntp server</span><span class="v" id="sys-ntp">...</span></div>
+  </div>
+  <div class="form-row" style="margin-top:.65rem;">
+    <label style="flex:1;">NTP server (DNS or IP)
+      <input id="ntp-input" placeholder="pool.ntp.org">
+    </label>
+    <button id="ntp-save">Save</button>
+    <span id="ntp-msg" class="text-muted small"></span>
+  </div>
+  <p class="text-muted small" style="margin-top:.4rem;">
+    Containers inherit the host clock — set your host OS to sync against this
+    NTP server. Change <code>TZ</code> in <code>.env</code> and recompose to
+    change the timezone applied to every container.
+  </p>
+</div>
+
+<div class="card">
+  <div class="section-header"><h2>Add policy</h2></div>
+  <form id="add-form" class="device-form">
+    <input type="text" name="name" placeholder="policy name" required>
+    <select name="table_name" required>
+      {% for t in tables %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+    </select>
+    <input type="number" name="retention_days" placeholder="days" min="1" max="3650" required style="width:100px;">
+    <input type="text" name="filter_clause" placeholder="optional WHERE fragment, e.g. severity = 'info'" style="flex:1;min-width:260px;">
+    <button type="submit">Add</button>
+  </form>
+  <div id="add-result" class="text-muted" style="margin-top:6px;"></div>
+</div>
+
+<div class="card">
+  <div class="section-header">
+    <h2>Active policies</h2>
+    <button id="refresh-btn">Refresh</button>
+  </div>
+  <table class="device-table">
+    <thead>
+      <tr>
+        <th>Name</th><th>Table</th><th>Filter</th><th>Days</th>
+        <th>Enabled</th><th>Last run</th><th>Last deleted</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="rt-tbody">
+      <tr><td colspan="8" class="text-muted">loading...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function() {
+  const TABLES = {{ tables | tojson }};
+  const tbody = document.getElementById('rt-tbody');
+  const addForm = document.getElementById('add-form');
+  const addResult = document.getElementById('add-result');
+  const refreshBtn = document.getElementById('refresh-btn');
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+  function fmt(d) { return d ? new Date(d).toLocaleString() : '\u2014'; }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/retention');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const rows = await r.json();
+      render(rows);
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="8" class="text-muted">error: ${e}</td></tr>`;
+    }
+  }
+
+  function render(rows) {
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="text-muted">no policies</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(p => `
+      <tr data-id="${p.id}">
+        <td><strong>${escapeHtml(p.name)}</strong></td>
+        <td>
+          <select class="rt-table">
+            ${TABLES.map(t => `<option value="${t}" ${t===p.table_name?'selected':''}>${t}</option>`).join('')}
+          </select>
+        </td>
+        <td><input class="rt-filter" value="${escapeHtml(p.filter_clause||'')}" placeholder="(none)"></td>
+        <td><input class="rt-days" type="number" min="1" max="3650" value="${p.retention_days}" style="width:80px;"></td>
+        <td><input class="rt-enabled" type="checkbox" ${p.enabled?'checked':''}></td>
+        <td class="text-muted small">${fmt(p.last_run)}</td>
+        <td class="text-muted small">${(p.last_deleted||0).toLocaleString()}</td>
+        <td class="device-actions">
+          <button class="save-btn">Save</button>
+          <button class="run-btn">Run now</button>
+          <button class="del-btn danger">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  tbody.addEventListener('click', async (e) => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    const id = tr.dataset.id;
+    if (e.target.classList.contains('save-btn')) {
+      const payload = {
+        table_name: tr.querySelector('.rt-table').value,
+        filter_clause: tr.querySelector('.rt-filter').value || null,
+        retention_days: parseInt(tr.querySelector('.rt-days').value, 10),
+        enabled: tr.querySelector('.rt-enabled').checked,
+      };
+      e.target.disabled = true;
+      e.target.textContent = 'saving...';
+      try {
+        const r = await fetch(`/api/retention/${id}`, {
+          method: 'PUT', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        e.target.textContent = 'saved';
+        setTimeout(() => { e.target.textContent='Save'; e.target.disabled=false; }, 1000);
+      } catch (err) {
+        alert('save failed: ' + err);
+        e.target.disabled = false;
+        e.target.textContent = 'Save';
+      }
+    } else if (e.target.classList.contains('run-btn')) {
+      if (!confirm('Run this policy immediately? Rows older than the cutoff will be deleted.')) return;
+      e.target.disabled = true;
+      e.target.textContent = 'running...';
+      try {
+        const r = await fetch(`/api/retention/${id}/run`, {method: 'POST'});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+        alert(`deleted ${d.deleted} rows`);
+        await load();
+      } catch (err) {
+        alert('run failed: ' + err);
+      } finally {
+        e.target.disabled = false;
+        e.target.textContent = 'Run now';
+      }
+    } else if (e.target.classList.contains('del-btn')) {
+      if (!confirm('Delete this policy?')) return;
+      try {
+        const r = await fetch(`/api/retention/${id}`, {method: 'DELETE'});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        await load();
+      } catch (err) { alert('delete failed: ' + err); }
+    }
+  });
+
+  addForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(addForm);
+    const payload = {
+      name: fd.get('name'),
+      table_name: fd.get('table_name'),
+      filter_clause: fd.get('filter_clause') || null,
+      retention_days: parseInt(fd.get('retention_days'), 10),
+      enabled: true,
+    };
+    try {
+      const r = await fetch('/api/retention', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || ('HTTP ' + r.status));
+      }
+      addResult.textContent = `added ${payload.name}`;
+      addForm.reset();
+      await load();
+    } catch (err) { addResult.textContent = 'error: ' + err; }
+  });
+
+  refreshBtn.addEventListener('click', load);
+  load();
+  setInterval(load, 60000);
+
+  // ── System info (timezone + NTP) ─────────────────────────────────────────
+  const sysTz = document.getElementById('sys-tz');
+  const sysTime = document.getElementById('sys-time');
+  const sysNtp = document.getElementById('sys-ntp');
+  const ntpInput = document.getElementById('ntp-input');
+  const ntpSave = document.getElementById('ntp-save');
+  const ntpMsg = document.getElementById('ntp-msg');
+
+  async function loadSystem() {
+    try {
+      const r = await fetch('/api/system/info');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      sysTz.textContent = d.tz || 'UTC';
+      sysTime.textContent = new Date(d.server_time).toLocaleString();
+      sysNtp.textContent = d.ntp_server || '\u2014';
+      if (!ntpInput.value) ntpInput.value = d.ntp_server || '';
+    } catch (e) {
+      sysTz.textContent = 'error';
+      sysTime.textContent = String(e);
+    }
+  }
+
+  ntpSave.addEventListener('click', async () => {
+    const server = (ntpInput.value || '').trim();
+    if (!server) { ntpMsg.textContent = 'enter an NTP host'; return; }
+    ntpMsg.textContent = 'saving...';
+    try {
+      const r = await fetch('/api/system/ntp', {
+        method: 'PUT', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({server}),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+      ntpMsg.textContent = 'saved \u2014 set host OS to sync against ' + d.ntp_server;
+      await loadSystem();
+    } catch (e) { ntpMsg.textContent = 'error: ' + e; }
+  });
+
+  loadSystem();
+  setInterval(loadSystem, 30000);
+})();
+</script>
+{% endblock %}

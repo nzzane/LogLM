@@ -21,6 +21,18 @@ log = logging.getLogger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 514
+BATCH_SIZE = int(os.environ.get("SYSLOG_BATCH_SIZE", "200"))
+BATCH_FLUSH_MS = int(os.environ.get("SYSLOG_BATCH_FLUSH_MS", "50"))
+QUEUE_MAX = int(os.environ.get("SYSLOG_QUEUE_MAX", "20000"))
+
+# Burst-dedup: drop identical (host, program, normalized-message) lines seen
+# more than once per window. The signature cache downstream already does this
+# at LLM cost level, but doing it here avoids shipping 1000s of duplicates to
+# redis in the first place. Counter is emitted periodically so no silent loss.
+DEDUP_WINDOW_SEC = float(os.environ.get("SYSLOG_DEDUP_WINDOW_SEC", "5"))
+DEDUP_MAX_KEYS = int(os.environ.get("SYSLOG_DEDUP_MAX_KEYS", "10000"))
+
+_queue: asyncio.Queue[str] | None = None
 
 # Syslog severity names (RFC 5424 §6.2.1)
 SEVERITY_NAMES = {
@@ -121,34 +133,84 @@ def parse_syslog(data: str, addr: tuple[str, int] | None = None) -> dict:
     }
 
 
+_dropped = 0
+_deduped = 0
+
+# Pre-enqueue burst dedup state: signature → (last_seen_monotonic, count)
+_dedup_seen: dict[str, tuple[float, int]] = {}
+_dedup_last_prune = 0.0
+
+_DEDUP_NORMALIZE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T?\d{0,2}:?\d{0,2}:?\d{0,2}\S*"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"
+    r"|0x[0-9a-fA-F]+"
+    r"|\b[0-9a-f]{12,}\b"
+    r"|\b\d+\b"
+)
+
+
+def _dedup_signature(event: dict) -> str:
+    msg = event.get("message", "") or ""
+    sig = _DEDUP_NORMALIZE.sub("#", msg)[:160]
+    return f"{event.get('host','')}|{event.get('program','') or ''}|{sig}"
+
+
+def _should_dedup(event: dict) -> bool:
+    """Return True if this event is a burst duplicate and should be dropped.
+    Keeps the first occurrence per window so downstream still sees it."""
+    global _dedup_last_prune
+    if DEDUP_WINDOW_SEC <= 0:
+        return False
+    # Never dedup high-severity lines — we want every error to reach the LLM
+    # even if the same error repeats rapidly.
+    sev = (event.get("severity") or "info").lower()
+    if sev in ("emerg", "alert", "crit", "err", "error"):
+        return False
+    now = asyncio.get_running_loop().time()
+    # Periodic prune to bound memory. Runs at most once per window.
+    if now - _dedup_last_prune > DEDUP_WINDOW_SEC:
+        cutoff = now - DEDUP_WINDOW_SEC
+        for k in list(_dedup_seen.keys()):
+            if _dedup_seen[k][0] < cutoff:
+                del _dedup_seen[k]
+        _dedup_last_prune = now
+        # Hard cap in case of signature explosion.
+        if len(_dedup_seen) > DEDUP_MAX_KEYS:
+            _dedup_seen.clear()
+    sig = _dedup_signature(event)
+    entry = _dedup_seen.get(sig)
+    if entry is None or now - entry[0] > DEDUP_WINDOW_SEC:
+        _dedup_seen[sig] = (now, 1)
+        return False
+    _dedup_seen[sig] = (entry[0], entry[1] + 1)
+    return True
+
+
+def enqueue(event: dict):
+    global _dropped, _deduped
+    if _should_dedup(event):
+        _deduped += 1
+        if _deduped % 1000 == 0:
+            log.info(f"burst dedup: {_deduped} duplicate events suppressed total")
+        return
+    try:
+        _queue.put_nowait(json.dumps(event))
+    except asyncio.QueueFull:
+        _dropped += 1
+        if _dropped % 500 == 0:
+            log.warning(f"Queue full, dropped {_dropped} events total")
+
+
 class UDPSyslogProtocol(asyncio.DatagramProtocol):
-    """Handles incoming UDP syslog datagrams."""
-
-    def __init__(self, redis_client: aioredis.Redis):
-        self.redis = redis_client
-        self._count = 0
-
     def datagram_received(self, data: bytes, addr: tuple[str, int]):
         try:
             text = data.decode("utf-8", errors="replace")
         except Exception:
             return
-        event = parse_syslog(text, addr)
-        asyncio.create_task(self._push(event))
-
-    async def _push(self, event: dict):
-        try:
-            await self.redis.rpush("loglm:raw", json.dumps(event))
-            self._count += 1
-            if self._count % 1000 == 0:
-                log.info(f"UDP: {self._count} messages received")
-        except Exception as e:
-            log.warning(f"Redis push failed: {e}")
+        enqueue(parse_syslog(text, addr))
 
 
-async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                            redis_client: aioredis.Redis):
-    """Handle a single TCP syslog connection (one message per line)."""
+async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     addr = writer.get_extra_info("peername")
     log.info(f"TCP connection from {addr}")
     try:
@@ -159,8 +221,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
-            event = parse_syslog(text, addr)
-            await redis_client.rpush("loglm:raw", json.dumps(event))
+            enqueue(parse_syslog(text, addr))
     except asyncio.TimeoutError:
         pass
     except Exception as e:
@@ -173,10 +234,48 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             pass
 
 
+async def batch_writer(redis_client: aioredis.Redis):
+    """Drain queue into Redis in batches to avoid one-rpush-per-message."""
+    total = 0
+    flush_interval = BATCH_FLUSH_MS / 1000.0
+    while True:
+        batch: list[str] = []
+        try:
+            first = await asyncio.wait_for(_queue.get(), timeout=1.0)
+            batch.append(first)
+        except asyncio.TimeoutError:
+            continue
+        deadline = asyncio.get_running_loop().time() + flush_interval
+        while len(batch) < BATCH_SIZE:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(_queue.get(), timeout=remaining)
+                batch.append(item)
+            except asyncio.TimeoutError:
+                break
+        try:
+            await redis_client.rpush("loglm:raw", *batch)
+            total += len(batch)
+            if total // 1000 != (total - len(batch)) // 1000:
+                log.info(f"syslog batcher: {total} events pushed (qsize={_queue.qsize()})")
+        except Exception as e:
+            log.warning(f"Redis batch push failed: {e}, requeueing {len(batch)}")
+            for item in batch:
+                try:
+                    _queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    break
+            await asyncio.sleep(1)
+
+
 async def main():
+    global _queue
+    _queue = asyncio.Queue(maxsize=QUEUE_MAX)
+
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-    # Wait for Redis
     for _ in range(30):
         try:
             await redis_client.ping()
@@ -185,29 +284,26 @@ async def main():
             log.info("Waiting for Redis...")
             await asyncio.sleep(2)
 
-    log.info(f"Syslog receiver starting on {LISTEN_HOST}:{LISTEN_PORT} (UDP+TCP)")
+    log.info(f"Syslog receiver starting on {LISTEN_HOST}:{LISTEN_PORT} (UDP+TCP, "
+             f"batch={BATCH_SIZE}, flush={BATCH_FLUSH_MS}ms, qmax={QUEUE_MAX})")
 
     loop = asyncio.get_running_loop()
 
-    # UDP listener
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: UDPSyslogProtocol(redis_client),
+    transport, _protocol = await loop.create_datagram_endpoint(
+        UDPSyslogProtocol,
         local_addr=(LISTEN_HOST, LISTEN_PORT),
     )
 
-    # TCP listener
     server = await asyncio.start_server(
-        lambda r, w: handle_tcp_client(r, w, redis_client),
-        LISTEN_HOST, LISTEN_PORT,
+        handle_tcp_client, LISTEN_HOST, LISTEN_PORT,
     )
 
     log.info("Syslog receiver ready (UDP + TCP)")
 
     try:
-        await asyncio.gather(
-            server.serve_forever(),
-            asyncio.Future(),  # keep UDP running
-        )
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(batch_writer(redis_client))
+            tg.create_task(server.serve_forever())
     finally:
         transport.close()
         server.close()

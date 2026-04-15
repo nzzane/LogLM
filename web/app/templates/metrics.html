@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}Metrics · LogLM{% endblock %}
+
+{% block content %}
+<h1>Metrics</h1>
+
+<div class="form-row">
+  <div class="form-group">
+    <label>Host</label>
+    <select id="host-select">
+      {% for h in hosts %}
+      <option value="{{ h.host }}">{{ h.sys_name or h.host }} ({{ h.host }})</option>
+      {% else %}
+      <option value="">No SNMP data yet</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group">
+    <label>Window</label>
+    <select id="hours-select">
+      <option value="1">1h</option>
+      <option value="6" selected>6h</option>
+      <option value="24">24h</option>
+      <option value="168">7d</option>
+    </select>
+  </div>
+  <button id="refresh-btn" type="button">Refresh</button>
+  <span id="last-update" class="text-muted" style="margin-left:auto;font-size:.75rem;"></span>
+</div>
+
+{% if not hosts %}
+<div class="card empty-state">
+  No SNMP metric history. Add <code>SNMP_TARGETS</code> in <code>.env</code> and wait one poll cycle.
+</div>
+{% else %}
+<div class="grid-2">
+  <div class="card">
+    <h2>CPU load (%)</h2>
+    <canvas id="chart-cpu" height="160"></canvas>
+  </div>
+  <div class="card">
+    <h2>Wifi clients</h2>
+    <canvas id="chart-wifi" height="160"></canvas>
+  </div>
+  <div class="card">
+    <h2>Traffic (bytes/sec)</h2>
+    <canvas id="chart-traffic" height="160"></canvas>
+  </div>
+  <div class="card">
+    <h2>Interfaces up / down</h2>
+    <canvas id="chart-ifaces" height="160"></canvas>
+  </div>
+  <div class="card">
+    <h2>Errors (per sec)</h2>
+    <canvas id="chart-errors" height="160"></canvas>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const charts = {};
+const baseOpts = {
+  responsive: true,
+  animation: false,
+  interaction: { mode: 'index', intersect: false },
+  scales: {
+    x: { ticks: { color: '#7c82a0', maxTicksLimit: 8 }, grid: { color: '#22263a' } },
+    y: { ticks: { color: '#7c82a0' }, grid: { color: '#22263a' }, beginAtZero: true },
+  },
+  plugins: { legend: { labels: { color: '#e2e4f0' } } },
+};
+
+function mkChart(id, datasets) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  return new Chart(el, { type: 'line', data: { labels: [], datasets }, options: baseOpts });
+}
+
+function init() {
+  charts.cpu = mkChart('chart-cpu', [
+    { label: 'CPU %', data: [], borderColor: '#6c8ef7', backgroundColor: 'rgba(108,142,247,.12)', tension: .3, fill: true },
+  ]);
+  charts.wifi = mkChart('chart-wifi', [
+    { label: 'Clients', data: [], borderColor: '#3dd68c', backgroundColor: 'rgba(61,214,140,.12)', tension: .3, fill: true },
+  ]);
+  charts.traffic = mkChart('chart-traffic', [
+    { label: 'In B/s', data: [], borderColor: '#5bc0de', tension: .3 },
+    { label: 'Out B/s', data: [], borderColor: '#f5a623', tension: .3 },
+  ]);
+  charts.ifaces = mkChart('chart-ifaces', [
+    { label: 'Up', data: [], borderColor: '#3dd68c', tension: .3 },
+    { label: 'Down', data: [], borderColor: '#f04f59', tension: .3 },
+  ]);
+  charts.errors = mkChart('chart-errors', [
+    { label: 'Errors/s', data: [], borderColor: '#f04f59', backgroundColor: 'rgba(240,79,89,.12)', tension: .3, fill: true },
+  ]);
+}
+
+async function loadData() {
+  const host = document.getElementById('host-select').value;
+  const hours = document.getElementById('hours-select').value;
+  if (!host) return;
+  const r = await fetch(`/api/metrics/${encodeURIComponent(host)}?hours=${hours}`);
+  if (!r.ok) return;
+  const d = await r.json();
+  const labels = d.points.map(p => p.t.substr(11, 5));
+  const fmt = (k) => d.points.map(p => p[k]);
+
+  const pairs = [
+    ['cpu', ['cpu']],
+    ['wifi', ['wifi']],
+    ['traffic', ['in_bps', 'out_bps']],
+    ['ifaces', ['if_up', 'if_down']],
+    ['errors', ['errors']],
+  ];
+  for (const [chart, keys] of pairs) {
+    if (!charts[chart]) continue;
+    charts[chart].data.labels = labels;
+    keys.forEach((k, i) => { charts[chart].data.datasets[i].data = fmt(k); });
+    charts[chart].update();
+  }
+  document.getElementById('last-update').textContent = `${d.points.length} points · ${new Date().toLocaleTimeString()}`;
+}
+
+if (document.getElementById('chart-cpu')) {
+  init();
+  loadData();
+  document.getElementById('host-select').addEventListener('change', loadData);
+  document.getElementById('hours-select').addEventListener('change', loadData);
+  document.getElementById('refresh-btn').addEventListener('click', loadData);
+  setInterval(loadData, 60000);
+}
+</script>
+{% endblock %}

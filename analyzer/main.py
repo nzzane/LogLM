@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone, timedelta
 
 import asyncpg
@@ -25,7 +24,13 @@ log = logging.getLogger(__name__)
 REDIS_URL = os.environ["REDIS_URL"]
 POSTGRES_DSN = os.environ["POSTGRES_DSN"]
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
+# Deep model used for analysis + memory summaries. Falls back to legacy OLLAMA_MODEL.
+OLLAMA_MODEL = os.environ.get(
+    "OLLAMA_MODEL_DEEP",
+    os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M"),
+)
+OLLAMA_MAX_CONCURRENT = int(os.environ.get("OLLAMA_MAX_CONCURRENT", "2"))
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 ANALYSIS_INTERVAL = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "60"))
 ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "300"))
@@ -33,15 +38,21 @@ MEMORY_INTERVAL = int(os.environ.get("MEMORY_INTERVAL_SECONDS", "300"))  # 5 min
 MAX_BATCH = 50
 MAX_MSG_LEN = 200
 
-_alert_cooldowns: dict[str, float] = {}
+_ollama_sem = asyncio.Semaphore(OLLAMA_MAX_CONCURRENT)
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 ANALYSIS_SYSTEM = """You are a security and infrastructure analyst reviewing log events from a home/small-office network.
 Devices include: Unifi router/firewall, Unifi access points, nginx reverse proxy, Linux servers, Raspberry Pis, Unraid NAS, and Docker containers.
-You also receive SNMP polling data (interface stats, wifi clients, CPU load, errors) from routers and APs.
+You also receive SNMP polling data (interface stats, wifi clients, CPU load, errors) from routers and APs, plus pre-classified SNMP alerts (link_down, link_flap, cpu_high, errors_high) emitted by the SNMP monitor when hard thresholds are breached.
 
-Your job: analyse the provided log/metric batch and identify anomalies, security threats, or service issues.
+Your job: analyse the provided log/metric/alert batch and decide whether anything warrants a NEW operator-visible alert.
+
+PRIORITY ORDER — follow strictly:
+1. USER-FLAGGED IMPORTANT examples below (if present) override every other rule. If a similar event is in the batch, alert.
+2. USER-FLAGGED IGNORE examples below (if present) suppress alerts even when other rules would fire.
+3. Pre-classified snmp_alert events (structured.type == "snmp_alert") are already known to be concerning — restate them and correlate with related events when possible.
+4. The hard rules below.
 
 Respond ONLY with valid JSON in this exact schema:
 {
@@ -57,16 +68,17 @@ Respond ONLY with valid JSON in this exact schema:
 If nothing notable is found, respond with: {"alert": false}
 
 Do NOT include any text outside the JSON object.
-Rules:
+Hard rules:
 - Multiple SSH failures from the same IP = credential stuffing attempt
 - >5 firewall blocks from same IP in short window = port scan
 - 5xx errors from nginx = service degradation
 - Authentication failures + privilege changes = possible compromise
 - Container crashes = service outage
-- Interface going down or high error rates = network issue
+- Interface going down or flapping = network fault, alert HIGH
+- Sustained CPU >85% or memory pressure = capacity / DDoS / runaway process
 - Sudden drop in wifi clients = potential AP failure
-- High CPU on router = possible DDoS or misconfiguration
-- SNMP poll showing interface errors increasing = cable/hardware issue
+- SNMP errors_high alert + linkDown trap on the same host = correlated hardware fault, alert HIGH
+- Multiple snmp_alert events on different hosts within seconds = upstream outage, alert CRITICAL
 """
 
 MEMORY_SYSTEM = """You are a system monitoring assistant. Given a batch of recent events and metrics,
@@ -90,8 +102,23 @@ def build_alert_prompt(events: list[dict], aliases: dict[str, str]) -> str:
         sev = e.get("severity", "info").upper()
         src = e.get("source", "syslog")
         msg = e.get("message", "")[:MAX_MSG_LEN]
-        lines.append(f"[{ts}] {sev} {host} ({src}): {msg}")
-    return f"Analyse these {len(events)} log events:\n\n" + "\n".join(lines)
+        line = f"[{ts}] {sev} {host} ({src}): {msg}"
+        # Surface SNMP alert metadata so the LLM doesn't have to re-derive it.
+        struct = e.get("structured") or {}
+        st = struct.get("type") if isinstance(struct, dict) else None
+        if st == "snmp_alert":
+            line += (
+                f"  [snmp_alert kind={struct.get('alert_type')}"
+                f" target={struct.get('target')}"
+                f" value={struct.get('value')}]"
+            )
+        elif st == "snmp_trap":
+            line += (
+                f"  [snmp_trap name={struct.get('trap_name')}"
+                f" desc={struct.get('trap_desc','')[:80]}]"
+            )
+        lines.append(line)
+    return f"Analyse these {len(events)} events:\n\n" + "\n".join(lines)
 
 
 async def get_aliases(pool: asyncpg.Pool) -> dict[str, str]:
@@ -100,29 +127,96 @@ async def get_aliases(pool: asyncpg.Pool) -> dict[str, str]:
         return {r["raw_name"]: r["alias"] for r in rows}
 
 
+async def get_feedback_examples(pool: asyncpg.Pool, limit: int = 20) -> list[dict]:
+    """Most-recent user-flagged events. Used as in-context training for the LLM."""
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT pattern, host, program, verdict, created_at "
+                "FROM event_feedback ORDER BY created_at DESC LIMIT $1",
+                limit,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.debug(f"feedback fetch failed: {e}")
+        return []
+
+
+def build_feedback_block(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    important = [r for r in rows if r.get("verdict") == "important"][:10]
+    ignore    = [r for r in rows if r.get("verdict") == "ignore"][:10]
+    if not important and not ignore:
+        return ""
+    parts = ["\nUSER-FLAGGED TRAINING EXAMPLES (treat similar lines accordingly):"]
+    if important:
+        parts.append("Marked IMPORTANT (alert on similar):")
+        for r in important:
+            host = (r.get("host") or "?")[:30]
+            prog = (r.get("program") or "?")[:20]
+            pat = (r.get("pattern") or "")[:160]
+            parts.append(f'  - {host} {prog}: "{pat}"')
+    if ignore:
+        parts.append("Marked IGNORE (do NOT alert on similar, even if rules match):")
+        for r in ignore:
+            host = (r.get("host") or "?")[:30]
+            prog = (r.get("program") or "?")[:20]
+            pat = (r.get("pattern") or "")[:160]
+            parts.append(f'  - {host} {prog}: "{pat}"')
+    return "\n".join(parts)
+
+
 async def call_ollama(http_client: httpx.AsyncClient, prompt: str,
                       system: str, max_tokens: int = 512) -> str | None:
-    """Generic Ollama call, returns raw text response."""
+    """Generic Ollama call. Retries with exponential backoff on 503/transient
+    transport errors so a temporarily overloaded Ollama instance does not
+    cascade into a flood of failed analyses."""
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "system": system,
         "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": 0.1,
             "num_predict": max_tokens,
         },
     }
-    try:
-        resp = await http_client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json=payload,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
-    except Exception as e:
-        log.error(f"Ollama call failed: {e}")
+    async with _ollama_sem:
+        delay = 2.0
+        for attempt in range(4):
+            try:
+                resp = await http_client.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json=payload,
+                    timeout=120,
+                )
+                # Retry transient overload codes from Ollama / reverse proxy.
+                if resp.status_code in (429, 502, 503, 504):
+                    if attempt < 3:
+                        log.warning(
+                            f"Ollama {resp.status_code} (attempt {attempt+1}), "
+                            f"backing off {delay:.1f}s")
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
+            except (httpx.ReadTimeout, httpx.ConnectTimeout,
+                    httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                if attempt < 3:
+                    log.warning(f"Ollama transport error {type(e).__name__}, "
+                                f"retry in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                log.error(f"Ollama call failed after retries: {e}")
+                return None
+            except Exception as e:
+                log.error(f"Ollama call failed: {e}")
+                return None
+        log.error("Ollama call exhausted retries")
         return None
 
 
@@ -139,16 +233,54 @@ def extract_json(text: str) -> dict | None:
 
 def _cooldown_key(result: dict) -> str:
     hosts = ",".join(sorted(result.get("affected_hosts", [])))
-    return f"{hosts}:{result.get('title','')[:40]}"
+    sev = result.get("severity", "medium")
+    return f"{hosts}:{sev}:{result.get('title','')[:40]}"
 
 
-def _is_cooled_down(result: dict) -> bool:
+async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -> tuple[bool, int]:
+    """
+    Returns (was_new, seen_count).
+    If a recent alert (within ALERT_COOLDOWN) has the same cooldown_key,
+    increments its seen_count and returns (False, new_count).
+    Else inserts a new row and returns (True, 1).
+    """
     key = _cooldown_key(result)
-    last = _alert_cooldowns.get(key, 0.0)
-    if time.monotonic() - last < ALERT_COOLDOWN:
-        return True
-    _alert_cooldowns[key] = time.monotonic()
-    return False
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT id, seen_count FROM alerts
+            WHERE cooldown_key = $1
+              AND last_seen > NOW() - ($2 * INTERVAL '1 second')
+            ORDER BY last_seen DESC LIMIT 1
+            """,
+            key, ALERT_COOLDOWN,
+        )
+        if existing:
+            new_count = (existing["seen_count"] or 1) + 1
+            await conn.execute(
+                "UPDATE alerts SET seen_count=$1, last_seen=NOW(), event_count=event_count+$2 WHERE id=$3",
+                new_count, event_count, existing["id"],
+            )
+            return False, new_count
+
+        await conn.execute(
+            """INSERT INTO alerts
+                   (timestamp, severity, title, description, affected_hosts,
+                    recommended_action, false_positive_risk, event_count,
+                    raw_result, cooldown_key, seen_count, last_seen)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,1,$1)""",
+            datetime.now(timezone.utc),
+            result.get("severity", "medium"),
+            result.get("title", "Unknown"),
+            result.get("description", ""),
+            result.get("affected_hosts", []),
+            result.get("recommended_action", ""),
+            result.get("false_positive_risk", "medium"),
+            event_count,
+            json.dumps(result),
+            key,
+        )
+        return True, 1
 
 
 SEVERITY_COLORS = {"critical": 0xFF0000, "high": 0xFF6600, "medium": 0xFFAA00, "low": 0x00AAFF}
@@ -184,22 +316,17 @@ async def post_discord(http_client: httpx.AsyncClient, result: dict, event_count
         log.error(f"Discord error: {e}")
 
 
-async def store_alert(pool: asyncpg.Pool, result: dict, event_count: int):
+# ── Schema migration (idempotent) ─────────────────────────────────────────────
+
+async def ensure_alert_schema(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO alerts (timestamp, severity, title, description, affected_hosts,
-                                   recommended_action, false_positive_risk, event_count, raw_result)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)""",
-            datetime.now(timezone.utc),
-            result.get("severity", "medium"),
-            result.get("title", "Unknown"),
-            result.get("description", ""),
-            result.get("affected_hosts", []),
-            result.get("recommended_action", ""),
-            result.get("false_positive_risk", "medium"),
-            event_count,
-            json.dumps(result),
-        )
+        await conn.execute("""
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS cooldown_key TEXT;
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS seen_count   INT DEFAULT 1;
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen    TIMESTAMPTZ;
+            UPDATE alerts SET last_seen = timestamp WHERE last_seen IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_alerts_cooldown_key ON alerts (cooldown_key, last_seen DESC);
+        """)
 
 
 # ── Alert analysis loop ───────────────────────────────────────────────────────
@@ -226,7 +353,9 @@ async def analyze_loop(redis_client, pool: asyncpg.Pool, http_client: httpx.Asyn
         log.info(f"Analyzing batch of {len(events)} events")
         aliases = await get_aliases(pool)
         prompt = build_alert_prompt(events, aliases)
-        text = await call_ollama(http_client, prompt, ANALYSIS_SYSTEM)
+        feedback = await get_feedback_examples(pool)
+        system = ANALYSIS_SYSTEM + build_feedback_block(feedback)
+        text = await call_ollama(http_client, prompt, system)
         if not text:
             continue
 
@@ -238,14 +367,11 @@ async def analyze_loop(redis_client, pool: asyncpg.Pool, http_client: httpx.Asyn
             continue
 
         log.info(f"ALERT [{result.get('severity','?')}]: {result.get('title','?')}")
-        if _is_cooled_down(result):
-            log.info("Cooldown suppressed")
+        was_new, seen = await _dedup_or_insert(pool, result, len(events))
+        if not was_new:
+            log.info(f"Dedup: incremented existing alert (seen {seen}×)")
             continue
-
-        await asyncio.gather(
-            post_discord(http_client, result, len(events)),
-            store_alert(pool, result, len(events)),
-        )
+        await post_discord(http_client, result, len(events))
 
 
 # ── Memory summariser loop ────────────────────────────────────────────────────
@@ -320,6 +446,47 @@ async def build_memory_summary(redis_client, pool: asyncpg.Pool, http_client: ht
         except Exception:
             pass
 
+    # Trend deltas from snmp_metrics history (last hour vs current).
+    # Lets the summary actually say "CPU jumped from X to Y on host Z".
+    snmp_trends: list[str] = []
+    try:
+        async with pool.acquire() as conn:
+            trend_rows = await conn.fetch("""
+                WITH recent AS (
+                    SELECT host,
+                           AVG(avg_cpu)        FILTER (WHERE timestamp > NOW() - INTERVAL '5 minutes')  AS cpu_now,
+                           AVG(avg_cpu)        FILTER (WHERE timestamp BETWEEN NOW() - INTERVAL '1 hour' AND NOW() - INTERVAL '5 minutes') AS cpu_prev,
+                           SUM(total_errors)   FILTER (WHERE timestamp > NOW() - INTERVAL '5 minutes')  AS err_now,
+                           SUM(total_errors)   FILTER (WHERE timestamp BETWEEN NOW() - INTERVAL '1 hour' AND NOW() - INTERVAL '5 minutes') AS err_prev,
+                           MAX(interfaces_down) FILTER (WHERE timestamp > NOW() - INTERVAL '5 minutes') AS down_now
+                    FROM snmp_metrics
+                    WHERE timestamp > NOW() - INTERVAL '1 hour'
+                    GROUP BY host
+                )
+                SELECT * FROM recent
+                WHERE cpu_now IS NOT NULL OR err_now IS NOT NULL
+            """)
+        for r in trend_rows:
+            host = r["host"]
+            cpu_now = r["cpu_now"]
+            cpu_prev = r["cpu_prev"]
+            err_now = r["err_now"]
+            err_prev = r["err_prev"]
+            bits: list[str] = []
+            if cpu_now is not None and cpu_prev is not None and cpu_prev > 0:
+                delta = cpu_now - cpu_prev
+                if abs(delta) >= 15:
+                    bits.append(f"CPU {cpu_prev:.0f}%→{cpu_now:.0f}%")
+            if err_now and err_prev is not None:
+                if err_now >= 5 * max(err_prev, 1):
+                    bits.append(f"errors {int(err_prev)}→{int(err_now)}")
+            if r["down_now"] and r["down_now"] > 0:
+                bits.append(f"{r['down_now']} ifaces down")
+            if bits:
+                snmp_trends.append(f"{host}: " + ", ".join(bits))
+    except Exception as e:
+        log.debug(f"snmp trend query failed: {e}")
+
     # Build prompt
     lines = [f"Time period: {period_start.isoformat()} to {now.isoformat()}"]
     lines.append(f"Events: {stats['total']} total, {stats['errors']} errors, {stats['warnings']} warnings, {stats['unique_hosts']} hosts")
@@ -336,6 +503,9 @@ async def build_memory_summary(redis_client, pool: asyncpg.Pool, http_client: ht
 
     if snmp_summaries:
         lines.append(f"\nSNMP metrics: {'; '.join(snmp_summaries)}")
+
+    if snmp_trends:
+        lines.append(f"\nSNMP trends (last hour): {'; '.join(snmp_trends)}")
 
     if prev_summary:
         lines.append(f"\nPrevious summary for comparison:\n{prev_summary}")
@@ -416,7 +586,12 @@ async def wait_for_ollama(http_client: httpx.AsyncClient):
 async def main():
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     pool = await asyncpg.create_pool(POSTGRES_DSN, min_size=2, max_size=5)
-    http_client = httpx.AsyncClient()
+    limits = httpx.Limits(
+        max_connections=OLLAMA_MAX_CONCURRENT,
+        max_keepalive_connections=OLLAMA_MAX_CONCURRENT,
+        keepalive_expiry=600.0,
+    )
+    http_client = httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(300.0, connect=5.0))
 
     for _ in range(30):
         try:
@@ -426,6 +601,7 @@ async def main():
             log.info("Waiting for Redis...")
             await asyncio.sleep(2)
 
+    await ensure_alert_schema(pool)
     await wait_for_ollama(http_client)
 
     async with asyncio.TaskGroup() as tg:

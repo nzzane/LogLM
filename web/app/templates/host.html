@@ -1,0 +1,251 @@
+{% extends "base.html" %}
+{% block title %}{{ host }} · LogLM{% endblock %}
+
+{% block content %}
+<div class="host-header">
+  <h1 id="host-title">{{ host }}</h1>
+  <div class="host-actions">
+    <button id="pin-btn" class="ghost">Pin</button>
+    <a class="ghost" href="/logs?host={{ host }}">Open in logs &rarr;</a>
+  </div>
+</div>
+<p class="text-muted" id="host-sub">loading...</p>
+
+<div class="host-grid">
+  <div class="card host-stats">
+    <div class="section-header"><h2>Activity</h2></div>
+    <div class="kv-grid" id="stats-kv"><span class="text-muted">loading...</span></div>
+  </div>
+
+  <div class="card host-snmp">
+    <div class="section-header"><h2>Latest SNMP</h2></div>
+    <div id="snmp-block" class="text-muted">no SNMP data</div>
+  </div>
+
+  <div class="card host-tags-card">
+    <div class="section-header"><h2>Tags</h2></div>
+    <div id="tag-list" class="tag-list"></div>
+    <div class="tag-add-row">
+      <input id="tag-input" placeholder="add tag (press enter)" maxlength="40">
+      <button id="tag-add">Add</button>
+    </div>
+    <div class="section-header" style="margin-top:1rem;"><h2>Notes</h2></div>
+    <textarea id="notes" placeholder="freeform notes about this host..." rows="4"></textarea>
+    <div class="row-end"><button id="notes-save">Save notes</button>
+      <span id="notes-msg" class="text-muted"></span></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="section-header"><h2>Active alerts</h2></div>
+  <div id="alerts-block"><span class="text-muted">loading...</span></div>
+</div>
+
+<div class="card">
+  <div class="section-header">
+    <h2>Recent events</h2>
+    <select id="sev-filter">
+      <option value="">all severities</option>
+      <option value="error">error+</option>
+      <option value="warning">warning+</option>
+    </select>
+  </div>
+  <table class="event-table">
+    <thead><tr><th>Time</th><th>Sev</th><th>Source</th><th>Message</th></tr></thead>
+    <tbody id="events-tbody"><tr><td colspan="4" class="text-muted">loading...</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+(function() {
+  const HOST = {{ host | tojson }};
+  const tagList = document.getElementById('tag-list');
+  const tagInput = document.getElementById('tag-input');
+  const tagAdd = document.getElementById('tag-add');
+  const notes = document.getElementById('notes');
+  const notesSave = document.getElementById('notes-save');
+  const notesMsg = document.getElementById('notes-msg');
+  const pinBtn = document.getElementById('pin-btn');
+  const sevFilter = document.getElementById('sev-filter');
+  const eventsTbody = document.getElementById('events-tbody');
+  const alertsBlock = document.getElementById('alerts-block');
+  const statsKv = document.getElementById('stats-kv');
+  const snmpBlock = document.getElementById('snmp-block');
+  const sub = document.getElementById('host-sub');
+
+  let currentTags = [];
+  let pinned = false;
+  let allEvents = [];
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+
+  function renderTags() {
+    tagList.innerHTML = '';
+    if (!currentTags.length) {
+      tagList.innerHTML = '<span class="text-muted">no tags</span>';
+      return;
+    }
+    currentTags.forEach(t => {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.innerHTML = `${escapeHtml(t)} <button class="chip-x" title="remove">&times;</button>`;
+      chip.querySelector('.chip-x').addEventListener('click', () => removeTag(t));
+      tagList.appendChild(chip);
+    });
+  }
+
+  async function saveMetadata(patch) {
+    const r = await fetch(`/api/host/${encodeURIComponent(HOST)}/metadata`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function addTag(t) {
+    t = (t || '').trim().toLowerCase();
+    if (!t) return;
+    if (currentTags.includes(t)) return;
+    const next = [...currentTags, t];
+    try {
+      const meta = await saveMetadata({tags: next});
+      currentTags = meta.tags || next;
+      renderTags();
+      tagInput.value = '';
+    } catch (e) { alert('save failed: ' + e); }
+  }
+
+  async function removeTag(t) {
+    const next = currentTags.filter(x => x !== t);
+    try {
+      const meta = await saveMetadata({tags: next});
+      currentTags = meta.tags || next;
+      renderTags();
+    } catch (e) { alert('remove failed: ' + e); }
+  }
+
+  tagAdd.addEventListener('click', () => addTag(tagInput.value));
+  tagInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); addTag(tagInput.value); }
+  });
+
+  notesSave.addEventListener('click', async () => {
+    notesMsg.textContent = 'saving...';
+    try {
+      await saveMetadata({notes: notes.value});
+      notesMsg.textContent = 'saved';
+      setTimeout(() => notesMsg.textContent = '', 1500);
+    } catch (e) { notesMsg.textContent = 'error: ' + e; }
+  });
+
+  pinBtn.addEventListener('click', async () => {
+    try {
+      const meta = await saveMetadata({pinned: !pinned});
+      pinned = !!meta.pinned;
+      pinBtn.textContent = pinned ? 'Unpin' : 'Pin';
+      pinBtn.classList.toggle('active', pinned);
+    } catch (e) { alert('pin failed: ' + e); }
+  });
+
+  function renderStats(s, alias, deviceLabel) {
+    const subParts = [];
+    if (alias) subParts.push(`alias: ${alias}`);
+    if (deviceLabel && deviceLabel !== HOST) subParts.push(`label: ${deviceLabel}`);
+    if (s.last_event) subParts.push(`last event: ${new Date(s.last_event).toLocaleString()}`);
+    sub.textContent = subParts.join(' \u00b7 ') || ' ';
+
+    statsKv.innerHTML = `
+      <div><span class="k">events 1h</span><span class="v">${s.events_1h ?? 0}</span></div>
+      <div><span class="k">events 24h</span><span class="v">${s.events_24h ?? 0}</span></div>
+      <div><span class="k">errors 24h</span><span class="v ${(s.errors_24h||0) > 0 ? 'bad' : ''}">${s.errors_24h ?? 0}</span></div>
+    `;
+  }
+
+  function renderSnmp(m) {
+    if (!m) { snmpBlock.textContent = 'no SNMP data'; return; }
+    const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : '?';
+    const parts = [];
+    if (m.sys_name) parts.push(`<strong>${escapeHtml(m.sys_name)}</strong>`);
+    if (m.avg_cpu != null) parts.push(`CPU ${m.avg_cpu}%`);
+    parts.push(`if ${m.interfaces_up||0}up / ${m.interfaces_down||0}down`);
+    if (m.wifi_clients) parts.push(`${m.wifi_clients} wifi clients`);
+    if (m.total_in_bps) parts.push(`in ${Math.round(m.total_in_bps)} B/s`);
+    if (m.total_out_bps) parts.push(`out ${Math.round(m.total_out_bps)} B/s`);
+    if (m.total_errors) parts.push(`<span class="bad">${m.total_errors.toFixed(1)} err/s</span>`);
+    snmpBlock.innerHTML = parts.join(' \u00b7 ') + `<div class="text-muted small">${ts}</div>`;
+  }
+
+  function renderAlerts(alerts) {
+    if (!alerts.length) {
+      alertsBlock.innerHTML = '<span class="text-muted">no recent alerts</span>';
+      return;
+    }
+    alertsBlock.innerHTML = alerts.map(a => `
+      <div class="alert-row sev-${escapeHtml(a.severity)}">
+        <div><strong>${escapeHtml(a.title)}</strong>
+          ${a.acknowledged ? '<span class="ack">ack</span>' : ''}
+          <span class="text-muted small">\u00d7${a.seen_count||1}</span></div>
+        <div class="text-muted small">${escapeHtml(a.description||'').substring(0,200)}</div>
+        <div class="text-muted small">${a.last_seen ? new Date(a.last_seen).toLocaleString() : ''}</div>
+      </div>
+    `).join('');
+  }
+
+  const SEVERITY_ORDER = ['emerg','alert','crit','err','error','warning','notice','info','debug'];
+  function sevAtLeast(have, want) {
+    if (!want) return true;
+    const hi = SEVERITY_ORDER.indexOf(have);
+    const wi = SEVERITY_ORDER.indexOf(want);
+    return hi >= 0 && hi <= wi;
+  }
+
+  function renderEvents() {
+    const filter = sevFilter.value;
+    const filtered = filter ? allEvents.filter(e => sevAtLeast(e.severity, filter)) : allEvents;
+    if (!filtered.length) {
+      eventsTbody.innerHTML = '<tr><td colspan="4" class="text-muted">no events</td></tr>';
+      return;
+    }
+    eventsTbody.innerHTML = filtered.map(e => `
+      <tr class="sev-${escapeHtml(e.severity)}">
+        <td class="text-muted small">${new Date(e.timestamp).toLocaleTimeString()}</td>
+        <td>${escapeHtml(e.severity)}</td>
+        <td>${escapeHtml(e.source)}</td>
+        <td><code>${escapeHtml(e.message).substring(0,300)}</code></td>
+      </tr>
+    `).join('');
+  }
+  sevFilter.addEventListener('change', renderEvents);
+
+  async function load() {
+    try {
+      const r = await fetch(`/api/host/${encodeURIComponent(HOST)}/summary`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      currentTags = d.metadata.tags || [];
+      pinned = !!d.metadata.pinned;
+      pinBtn.textContent = pinned ? 'Unpin' : 'Pin';
+      pinBtn.classList.toggle('active', pinned);
+      notes.value = d.metadata.notes || '';
+      renderTags();
+      renderStats(d.stats || {}, d.alias, d.device && d.device.label);
+      renderSnmp(d.snmp_latest);
+      renderAlerts(d.alerts || []);
+      allEvents = d.events || [];
+      renderEvents();
+    } catch (e) {
+      sub.textContent = 'load error: ' + e;
+    }
+  }
+
+  load();
+  setInterval(load, 30000);
+})();
+</script>
+{% endblock %}

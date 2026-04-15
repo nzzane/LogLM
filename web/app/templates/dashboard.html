@@ -20,6 +20,38 @@
   </div>
 </div>
 
+<!-- Active warnings panel -->
+<div class="section-header">
+  <h2>Systems with active warnings</h2>
+  <a href="/alerts" class="text-muted" style="font-size:.75rem;">View all →</a>
+</div>
+{% if warnings %}
+<div class="warnings-grid">
+  {% for w in warnings %}
+  <div class="warning-card {{ w.severity }}">
+    <div class="warning-head">
+      <span class="badge badge-{{ w.severity }}">{{ w.severity }}</span>
+      <span class="warning-hosts">
+        {% if w.affected_hosts %}{{ w.affected_hosts | join(', ') }}{% else %}—{% endif %}
+      </span>
+      {% if w.seen_count and w.seen_count > 1 %}
+      <span class="badge badge-count">{{ w.seen_count }}×</span>
+      {% endif %}
+    </div>
+    <div class="warning-title">{{ w.title }}</div>
+    <div class="warning-desc">{{ (w.description or '')[:160] }}{% if w.description and w.description|length > 160 %}…{% endif %}</div>
+    <div class="warning-foot">
+      {% if w.last_seen %}<span>{{ w.last_seen.strftime('%m-%d %H:%M') }}</span>{% endif %}
+      <button class="btn secondary" style="font-size:.7rem;padding:.15rem .5rem;"
+              onclick="ackAlert({{ w.id }}, this)">Ack</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card empty-state">No active warnings — all systems nominal.</div>
+{% endif %}
+
 <!-- Service status -->
 {% if services %}
 <div class="section-header">
@@ -53,6 +85,9 @@
         <div class="alert-header">
           <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
           <span class="alert-title">{{ alert.title }}</span>
+          {% if alert.seen_count and alert.seen_count > 1 %}
+          <span class="badge badge-count">{{ alert.seen_count }}×</span>
+          {% endif %}
           {% if not alert.acknowledged %}
           <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
                   onclick="ackAlert({{ alert.id }}, this)">Ack</button>
@@ -78,11 +113,20 @@
     </div>
     <div id="live-feed">
       {% for event in events %}
-      <div class="log-line">
+      <div class="log-line"
+           data-fb="1"
+           data-event-id="{{ event.id }}"
+           data-host="{{ event.host }}"
+           data-program="{{ event.program or '' }}"
+           data-pattern="{{ event.message[:200] }}">
         <span class="log-ts">{{ event.timestamp.strftime('%H:%M:%S') }}</span>
         <span class="log-host">{{ event.host }}</span>
         <span class="badge badge-{{ event.severity }}">{{ event.severity }}</span>
         <span class="log-msg">{{ event.message[:200] }}</span>
+        <span class="fb-actions">
+          <button class="fb-btn fb-imp" title="Mark important" onclick="fbFromButton(this,'important')">★</button>
+          <button class="fb-btn fb-ign" title="Ignore future" onclick="fbFromButton(this,'ignore')">✕</button>
+        </span>
       </div>
       {% endfor %}
     </div>

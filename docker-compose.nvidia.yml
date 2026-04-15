@@ -7,11 +7,10 @@ services:
     container_name: loglm-ollama
     restart: unless-stopped
     volumes:
-      - ollama_models:/root/.ollama
-    ports:
-      - "11434:11434"
+      - ${STORAGE_PATH:-./data}/ollama:/root/.ollama
     networks:
-      - loglm
+      br0:
+        ipv4_address: 10.20.10.108
     deploy:
       resources:
         reservations:
@@ -28,7 +27,8 @@ services:
       /bin/sh -c "
         ollama serve &
         sleep 5
-        ollama pull $${OLLAMA_MODEL:-llama3.1:8b-instruct-q4_K_M}
+        ollama pull $${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
+        ollama pull $${OLLAMA_MODEL_FAST:-llama3.2:1b}
         wait
       "
 

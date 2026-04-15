@@ -1,0 +1,266 @@
+{% extends "base.html" %}
+{% block title %}Devices · LogLM{% endblock %}
+
+{% block content %}
+<h1>Devices</h1>
+<p class="text-muted">SNMP devices polled by the snmp service. Add manually or sync from LibreNMS.</p>
+
+<div class="card">
+  <div class="section-header">
+    <h2>LibreNMS</h2>
+    <span id="libre-status" class="text-muted">
+      {% if librenms_configured %}configured: {{ librenms_url }}{% else %}not configured (set LIBRENMS_URL + LIBRENMS_TOKEN){% endif %}
+    </span>
+  </div>
+  <div class="libre-controls">
+    <input type="text" id="libre-url" placeholder="https://librenms.lan" value="{{ librenms_url }}" style="min-width:260px;">
+    <input type="password" id="libre-token" placeholder="API token (leave blank to use env)" style="min-width:260px;">
+    <button id="libre-test">Test connection</button>
+    <button id="libre-sync">Pull device inventory</button>
+  </div>
+  <div id="libre-result" class="text-muted" style="margin-top:6px;"></div>
+</div>
+
+<div class="card">
+  <div class="section-header"><h2>Add device</h2></div>
+  <form id="add-form" class="device-form">
+    <input type="text" name="host" placeholder="host or IP" required>
+    <input type="number" name="port" value="161" min="1" max="65535" style="width:80px;">
+    <input type="text" name="community" placeholder="community" value="public">
+    <select name="device_type">
+      {% for t in device_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+    </select>
+    <input type="text" name="label" placeholder="label (optional)">
+    <button type="button" id="add-test">Test</button>
+    <button type="submit">Save</button>
+  </form>
+  <div id="add-result" class="text-muted" style="margin-top:6px;"></div>
+</div>
+
+<div class="card">
+  <div class="section-header">
+    <h2>Configured devices</h2>
+    <button id="refresh-btn">Refresh</button>
+  </div>
+  <table class="device-table">
+    <thead>
+      <tr>
+        <th>Host</th><th>Type</th><th>Label</th><th>Community</th>
+        <th>Port</th><th>Source</th><th>Status</th><th>Last polled</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="device-tbody">
+      <tr><td colspan="9" class="text-muted">Loading...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function() {
+  const tbody = document.getElementById('device-tbody');
+  const addForm = document.getElementById('add-form');
+  const addResult = document.getElementById('add-result');
+  const addTestBtn = document.getElementById('add-test');
+  const libreUrl = document.getElementById('libre-url');
+  const libreToken = document.getElementById('libre-token');
+  const libreTest = document.getElementById('libre-test');
+  const libreSync = document.getElementById('libre-sync');
+  const libreResult = document.getElementById('libre-result');
+  const refreshBtn = document.getElementById('refresh-btn');
+
+  const DEVICE_TYPES = {{ device_types | tojson }};
+
+  function fmt(d) { return d ? new Date(d).toLocaleString() : '—'; }
+  function statusBadge(s) {
+    if (!s) return '<span class="text-muted">—</span>';
+    const cls = s === 'ok' ? 'ok' : (s === 'unreachable' ? 'warn' : 'err');
+    return `<span class="status-${cls}">${s}</span>`;
+  }
+
+  function readForm() {
+    const fd = new FormData(addForm);
+    return {
+      host: fd.get('host'),
+      port: parseInt(fd.get('port'), 10) || 161,
+      community: fd.get('community') || 'public',
+      device_type: fd.get('device_type') || 'auto',
+      label: fd.get('label') || null,
+      enabled: true,
+    };
+  }
+
+  async function loadDevices() {
+    try {
+      const r = await fetch('/api/devices');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      renderDevices(d.devices || []);
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="9" class="text-muted">Error: ${e}</td></tr>`;
+    }
+  }
+
+  function renderDevices(devs) {
+    if (!devs.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="text-muted">No devices configured. Add one above or sync from LibreNMS.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = devs.map(d => `
+      <tr data-id="${d.id}">
+        <td><strong>${d.host}</strong></td>
+        <td>
+          <select class="dt-select">
+            ${DEVICE_TYPES.map(t => `<option value="${t}" ${t===d.device_type?'selected':''}>${t}</option>`).join('')}
+          </select>
+        </td>
+        <td><input class="lbl-input" value="${(d.label || '').replace(/"/g, '&quot;')}" placeholder="—"></td>
+        <td><input class="comm-input" value="${(d.community || '').replace(/"/g, '&quot;')}"></td>
+        <td><input class="port-input" type="number" min="1" max="65535" value="${d.port}" style="width:70px;"></td>
+        <td>${d.source || 'manual'}</td>
+        <td>${statusBadge(d.last_status)}${d.last_error ? `<div class="text-muted" style="font-size:0.8em;">${d.last_error.substring(0,120)}</div>` : ''}</td>
+        <td class="text-muted" style="font-size:0.85em;">${fmt(d.last_polled)}</td>
+        <td class="device-actions">
+          <button class="save-btn">Save</button>
+          <button class="test-btn">Test</button>
+          <button class="del-btn danger">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  tbody.addEventListener('click', async (e) => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    const id = tr.dataset.id;
+    if (e.target.classList.contains('save-btn')) {
+      const payload = {
+        host: tr.querySelector('strong').textContent.trim(),
+        port: parseInt(tr.querySelector('.port-input').value, 10) || 161,
+        community: tr.querySelector('.comm-input').value || 'public',
+        device_type: tr.querySelector('.dt-select').value,
+        label: tr.querySelector('.lbl-input').value || null,
+        enabled: true,
+      };
+      e.target.disabled = true;
+      e.target.textContent = 'Saving...';
+      try {
+        const r = await fetch(`/api/devices/${id}`, {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        e.target.textContent = 'Saved';
+        setTimeout(() => { e.target.textContent = 'Save'; e.target.disabled = false; }, 1000);
+      } catch (err) {
+        alert('Save failed: ' + err);
+        e.target.disabled = false;
+        e.target.textContent = 'Save';
+      }
+    } else if (e.target.classList.contains('test-btn')) {
+      e.target.disabled = true;
+      e.target.textContent = 'Testing...';
+      try {
+        const r = await fetch(`/api/devices/${id}/test`, {method: 'POST'});
+        const d = await r.json();
+        alert((d.ok ? 'OK\n\n' : 'FAIL\n\n') + d.message);
+        await loadDevices();
+      } catch (err) {
+        alert('Test error: ' + err);
+      } finally {
+        e.target.disabled = false;
+        e.target.textContent = 'Test';
+      }
+    } else if (e.target.classList.contains('del-btn')) {
+      if (!confirm('Delete this device?')) return;
+      try {
+        const r = await fetch(`/api/devices/${id}`, {method: 'DELETE'});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        await loadDevices();
+      } catch (err) {
+        alert('Delete failed: ' + err);
+      }
+    }
+  });
+
+  addForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const payload = readForm();
+    try {
+      const r = await fetch('/api/devices', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || ('HTTP ' + r.status));
+      }
+      addResult.textContent = `Added ${payload.host}`;
+      addForm.reset();
+      addForm.querySelector('[name=port]').value = 161;
+      addForm.querySelector('[name=community]').value = 'public';
+      await loadDevices();
+    } catch (err) {
+      addResult.textContent = 'Error: ' + err;
+    }
+  });
+
+  addTestBtn.addEventListener('click', async () => {
+    const payload = readForm();
+    if (!payload.host) { addResult.textContent = 'Host required'; return; }
+    addResult.textContent = 'Testing...';
+    try {
+      const r = await fetch('/api/devices/test', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      addResult.textContent = (d.ok ? 'OK — ' : 'FAIL — ') + d.message;
+    } catch (err) {
+      addResult.textContent = 'Test error: ' + err;
+    }
+  });
+
+  function librePayload() {
+    return { url: libreUrl.value || null, token: libreToken.value || null };
+  }
+
+  libreTest.addEventListener('click', async () => {
+    libreResult.textContent = 'Testing...';
+    try {
+      const r = await fetch('/api/librenms/test', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(librePayload()),
+      });
+      const d = await r.json();
+      libreResult.textContent = (d.ok ? 'OK — ' : 'FAIL — ') + d.message;
+    } catch (e) {
+      libreResult.textContent = 'Error: ' + e;
+    }
+  });
+
+  libreSync.addEventListener('click', async () => {
+    if (!confirm('Pull device inventory from LibreNMS? Existing manual devices will not be overwritten.')) return;
+    libreResult.textContent = 'Syncing...';
+    try {
+      const r = await fetch('/api/librenms/sync', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(librePayload()),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || ('HTTP ' + r.status));
+      }
+      const d = await r.json();
+      libreResult.textContent = `Synced: ${d.inserted} new, ${d.updated} updated (of ${d.total} in LibreNMS)`;
+      await loadDevices();
+    } catch (e) {
+      libreResult.textContent = 'Sync failed: ' + e;
+    }
+  });
+
+  refreshBtn.addEventListener('click', loadDevices);
+  loadDevices();
+  setInterval(loadDevices, 30000);
+})();
+</script>
+{% endblock %}

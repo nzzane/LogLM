@@ -1,0 +1,75 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  LogLM Configuration — copy to .env and fill in values
+# ══════════════════════════════════════════════════════════════════════════════
+
+POSTGRES_PASSWORD=change_me_strong_password
+SECRET_KEY=change_me_random_32_chars
+
+# ── Discord ──────────────────────────────────────────────────────────────────
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+
+# ── Ollama LLM ───────────────────────────────────────────────────────────────
+# For local Docker Ollama (NVIDIA GPU):
+#   OLLAMA_URL=http://ollama:11434
+# For host-native Ollama (Mac / external server):
+#   OLLAMA_URL=http://host.docker.internal:11434
+# For a remote Ollama instance:
+#   OLLAMA_URL=http://192.168.1.50:11434
+OLLAMA_URL=http://host.docker.internal:11434
+
+# Model selection:
+#   Mac M4 (recommended):     llama3.2:3b       (~2 GB, fast on Metal)
+#   NVIDIA 8 GB (default):    llama3.1:8b-instruct-q4_K_M  (~4.7 GB VRAM)
+#   Lighter NVIDIA option:    mistral:7b-instruct-q4_K_M   (~4.1 GB VRAM)
+OLLAMA_MODEL=llama3.2:3b
+
+# ── Web UI ───────────────────────────────────────────────────────────────────
+WEB_PORT=8080
+
+# ── LibreNMS integration (optional) ──────────────────────────────────────────
+LIBRENMS_URL=
+LIBRENMS_TOKEN=
+
+# ── SNMP polling ─────────────────────────────────────────────────────────────
+# Comma-separated targets: host:port or just host (default port 161)
+# Example: 192.168.1.1,192.168.1.2:161,unifi-ap-office
+SNMP_TARGETS=
+SNMP_COMMUNITY=public
+SNMP_POLL_INTERVAL=60
+
+# ── Tuning ───────────────────────────────────────────────────────────────────
+# Alert de-duplication cooldown per service (seconds)
+ALERT_COOLDOWN_SECONDS=300
+# How often the analyzer checks for anomalies (seconds)
+ANALYSIS_INTERVAL_SECONDS=60
+# How often the memory summariser runs (seconds)
+MEMORY_INTERVAL_SECONDS=300
+
+# ── Ollama concurrency / persistence ─────────────────────────────────────────
+OLLAMA_MAX_CONCURRENT=2
+OLLAMA_KEEP_ALIVE=30m
+
+# ── Two-model split (fast categorizer + deep analyzer) ───────────────────────
+# Fast model: cheap pre-classifier called per-event by the processor.
+#   Recommended: tinyllama:1.1b, qwen2.5:0.5b, llama3.2:1b
+# Deep model: heavy reasoning for batched analysis + chat.
+#   Recommended: llama3.1:8b-instruct-q4_K_M, qwen2.5:7b
+OLLAMA_MODEL_FAST=llama3.2:1b
+OLLAMA_MODEL_DEEP=llama3.1:8b-instruct-q4_K_M
+# Set to 0 to disable per-event fast categorization (uses static rules only)
+PROCESSOR_USE_FAST_LLM=0
+
+# ── External storage ─────────────────────────────────────────────────────────
+# Bind-mount host paths so postgres/loki/redis don't fill the docker image layer.
+# Point this at a big external/NAS disk: e.g. /mnt/loglm or /srv/loglm
+STORAGE_PATH=./data
+
+# ── Time / NTP ───────────────────────────────────────────────────────────────
+# IANA timezone applied to every container (logs, scheduler, UI render).
+# Examples: UTC, Europe/London, America/New_York, Australia/Sydney
+TZ=UTC
+
+# Preferred NTP server. The host OS is responsible for actually syncing the
+# clock — containers inherit the host time. LogLM displays this value on the
+# Retention page so admins know which server should be authoritative.
+NTP_SERVER=pool.ntp.org

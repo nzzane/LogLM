@@ -10,6 +10,9 @@
     <div class="alert-header">
       <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
       <span class="alert-title">{{ alert.title }}</span>
+      {% if alert.seen_count and alert.seen_count > 1 %}
+      <span class="badge badge-count" title="Times this alert has recurred">{{ alert.seen_count }}×</span>
+      {% endif %}
       <span class="badge badge-{{ 'ok' if alert.false_positive_risk == 'low' else ('medium' if alert.false_positive_risk == 'medium' else 'high') }}"
             title="False positive risk">FP: {{ alert.false_positive_risk }}</span>
       {% if not alert.acknowledged %}
@@ -20,7 +23,10 @@
       {% endif %}
     </div>
     <div class="alert-meta">
-      {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} UTC
+      First: {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} UTC
+      {% if alert.last_seen and alert.seen_count and alert.seen_count > 1 %}
+      · Last: {{ alert.last_seen.strftime('%H:%M:%S') }}
+      {% endif %}
       · {{ alert.event_count }} events analysed
       {% if alert.affected_hosts %}· Hosts: {{ alert.affected_hosts | join(', ') }}{% endif %}
     </div>

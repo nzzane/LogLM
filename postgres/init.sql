@@ -22,6 +22,7 @@ CREATE INDEX idx_events_severity ON events (severity);
 CREATE TABLE IF NOT EXISTS alerts (
     id                  BIGSERIAL PRIMARY KEY,
     timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     severity            TEXT NOT NULL,
     title               TEXT NOT NULL,
     description         TEXT,
@@ -29,12 +30,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     recommended_action  TEXT,
     false_positive_risk TEXT,
     event_count         INT,
+    seen_count          INT DEFAULT 1,
+    cooldown_key        TEXT,
     acknowledged        BOOLEAN DEFAULT FALSE,
     raw_result          JSONB DEFAULT '{}'
 );
 
 CREATE INDEX idx_alerts_timestamp ON alerts (timestamp DESC);
+CREATE INDEX idx_alerts_last_seen ON alerts (last_seen DESC);
 CREATE INDEX idx_alerts_severity ON alerts (severity);
+CREATE INDEX idx_alerts_cooldown_key ON alerts (cooldown_key, last_seen DESC);
 
 -- Service aliases: map raw hostnames/IPs to friendly names
 CREATE TABLE IF NOT EXISTS service_aliases (
@@ -109,8 +114,181 @@ CREATE TABLE IF NOT EXISTS snmp_metrics (
 
 CREATE INDEX idx_snmp_metrics_host_ts ON snmp_metrics (host, timestamp DESC);
 
--- Prune events older than 7 days (run via pg_cron or external cron)
--- To enable pg_cron: CREATE EXTENSION pg_cron;
--- SELECT cron.schedule('prune-events', '0 3 * * *', 'DELETE FROM events WHERE timestamp < NOW() - INTERVAL ''7 days''');
--- SELECT cron.schedule('prune-snmp', '0 3 * * *', 'DELETE FROM snmp_metrics WHERE timestamp < NOW() - INTERVAL ''30 days''');
--- SELECT cron.schedule('prune-memory', '0 3 * * *', 'DELETE FROM memory_summaries WHERE timestamp < NOW() - INTERVAL ''90 days''');
+-- SNMP devices managed via the web UI / pulled from LibreNMS.
+-- The snmp service reads from this table on every poll cycle so admin
+-- changes take effect without a restart.
+CREATE TABLE IF NOT EXISTS snmp_devices (
+    id          SERIAL PRIMARY KEY,
+    host        TEXT NOT NULL UNIQUE,
+    port        INT  NOT NULL DEFAULT 161,
+    community   TEXT NOT NULL DEFAULT 'public',
+    device_type TEXT NOT NULL DEFAULT 'auto',  -- auto/router/switch/ap/firewall/server
+    label       TEXT,
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    source      TEXT NOT NULL DEFAULT 'manual', -- manual/env/librenms
+    last_polled TIMESTAMPTZ,
+    last_status TEXT,                            -- ok / error / unreachable
+    last_error  TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_snmp_devices_enabled ON snmp_devices (enabled);
+
+-- User feedback for AI training (click important / click ignore)
+CREATE TABLE IF NOT EXISTS event_feedback (
+    id          BIGSERIAL PRIMARY KEY,
+    event_id    BIGINT,                  -- optional link to events.id
+    host        TEXT,
+    program     TEXT,
+    pattern     TEXT NOT NULL,           -- message substring / regex fragment
+    verdict     TEXT NOT NULL,           -- important / ignore
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_feedback_verdict ON event_feedback (verdict);
+CREATE INDEX idx_feedback_host_program ON event_feedback (host, program);
+
+-- Per-host metadata: tags, notes, pin state.
+-- Host is the natural key; we never delete history when a tag changes.
+CREATE TABLE IF NOT EXISTS host_metadata (
+    host        TEXT PRIMARY KEY,
+    tags        TEXT[] NOT NULL DEFAULT '{}',
+    notes       TEXT,
+    pinned      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_host_metadata_pinned ON host_metadata (pinned) WHERE pinned;
+CREATE INDEX IF NOT EXISTS idx_host_metadata_tags   ON host_metadata USING GIN (tags);
+
+-- Topology graph: nodes are hosts (one row per host) with a saved
+-- position (x,y), color and icon hint. Edges link two hosts.
+CREATE TABLE IF NOT EXISTS topology_nodes (
+    host        TEXT PRIMARY KEY,
+    label       TEXT,
+    icon        TEXT NOT NULL DEFAULT 'server',  -- router/switch/ap/firewall/server/cloud
+    color       TEXT,
+    x           REAL,
+    y           REAL,
+    pinned      BOOLEAN NOT NULL DEFAULT FALSE,
+    notes       TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS topology_edges (
+    id          SERIAL PRIMARY KEY,
+    from_host   TEXT NOT NULL,
+    to_host     TEXT NOT NULL,
+    label       TEXT,
+    color       TEXT,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    auto        BOOLEAN NOT NULL DEFAULT FALSE,  -- true = auto-discovered
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (from_host, to_host)
+);
+CREATE INDEX IF NOT EXISTS idx_topology_edges_from ON topology_edges (from_host);
+CREATE INDEX IF NOT EXISTS idx_topology_edges_to   ON topology_edges (to_host);
+
+-- Retention policies: each row prunes a slice of one table.
+-- The processor runs them hourly. filter_clause is appended to the
+-- WHERE on top of the timestamp guard.
+CREATE TABLE IF NOT EXISTS retention_policies (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    table_name      TEXT NOT NULL,
+    filter_clause   TEXT,            -- optional extra SQL WHERE fragment
+    retention_days  INT  NOT NULL,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    last_run        TIMESTAMPTZ,
+    last_deleted    BIGINT NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO retention_policies (name, table_name, filter_clause, retention_days) VALUES
+    ('events_drop',       'events',           'verdict = ''drop''',                         7),
+    ('events_store',      'events',           'verdict = ''store''',                        30),
+    ('events_keep',       'events',           'verdict = ''keep''',                         90),
+    ('alerts_old',        'alerts',           'acknowledged = TRUE OR severity = ''info''', 365),
+    ('snmp_metrics_old',  'snmp_metrics',     NULL,                                          90),
+    ('memory_summaries',  'memory_summaries', NULL,                                          365),
+    ('firewall_flows_old','firewall_flows',   NULL,                                          30),
+    ('anomaly_old',       'anomaly_detections','acknowledged = TRUE',                       60)
+ON CONFLICT (name) DO NOTHING;
+
+-- ── Firewall flows: structured row per parsed firewall event ─────────────────
+-- Stores the denormalised flow so we can aggregate (top blocked sources, most
+-- targeted ports, external scanners, concerning outbound flows, etc.) without
+-- having to re-parse the raw message from the events table.
+CREATE TABLE IF NOT EXISTS firewall_flows (
+    id              BIGSERIAL PRIMARY KEY,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    host            TEXT NOT NULL,        -- firewall device that emitted the log
+    action          TEXT NOT NULL,        -- block/drop/accept/...
+    blocked         BOOLEAN NOT NULL DEFAULT FALSE,
+    direction       TEXT,                 -- inbound/outbound/internal/transit
+    src_ip          INET,
+    dst_ip          INET,
+    src_port        INT,
+    dst_port        INT,
+    proto           TEXT,
+    in_iface        TEXT,
+    out_iface       TEXT,
+    port_name       TEXT,                 -- well-known port name if known
+    concerning      BOOLEAN NOT NULL DEFAULT FALSE,
+    concerning_reasons TEXT[] NOT NULL DEFAULT '{}',
+    event_id        BIGINT REFERENCES events(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ff_ts           ON firewall_flows (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ff_host         ON firewall_flows (host, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ff_src          ON firewall_flows (src_ip);
+CREATE INDEX IF NOT EXISTS idx_ff_dst_port     ON firewall_flows (dst_port) WHERE blocked;
+CREATE INDEX IF NOT EXISTS idx_ff_concerning   ON firewall_flows (timestamp DESC) WHERE concerning;
+
+-- ── Event signatures: baseline for anomaly learning ──────────────────────────
+-- Normalised message signature per host+program. first_seen anchors the
+-- "is this new?" check, count + daily rollups drive rate-spike detection.
+CREATE TABLE IF NOT EXISTS event_signatures (
+    id              BIGSERIAL PRIMARY KEY,
+    signature       TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    program         TEXT NOT NULL,
+    severity        TEXT NOT NULL,
+    sample_message  TEXT,
+    first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    total_count     BIGINT NOT NULL DEFAULT 1,
+    -- Sliding-window counts (updated in-place; cheaper than a full history table)
+    count_1h        BIGINT NOT NULL DEFAULT 1,
+    count_24h       BIGINT NOT NULL DEFAULT 1,
+    window_1h_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    window_24h_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    baseline_per_hour REAL NOT NULL DEFAULT 0,  -- learned rolling mean
+    baseline_samples INT NOT NULL DEFAULT 0,
+    UNIQUE (signature, host, program)
+);
+CREATE INDEX IF NOT EXISTS idx_sig_last_seen ON event_signatures (last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_sig_first_seen ON event_signatures (first_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_sig_host ON event_signatures (host);
+
+-- ── Anomaly detections: things the baseline flagged as weird ─────────────────
+CREATE TABLE IF NOT EXISTS anomaly_detections (
+    id              BIGSERIAL PRIMARY KEY,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    kind            TEXT NOT NULL,          -- new_signature / rate_spike / concerning_flow
+    host            TEXT NOT NULL,
+    program         TEXT,
+    signature       TEXT,
+    severity        TEXT NOT NULL DEFAULT 'warning',
+    title           TEXT NOT NULL,
+    description     TEXT,
+    sample          TEXT,
+    baseline        REAL,
+    observed        REAL,
+    acknowledged    BOOLEAN NOT NULL DEFAULT FALSE,
+    raw             JSONB DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_anom_ts   ON anomaly_detections (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_anom_host ON anomaly_detections (host);
+CREATE INDEX IF NOT EXISTS idx_anom_kind ON anomaly_detections (kind, timestamp DESC);
