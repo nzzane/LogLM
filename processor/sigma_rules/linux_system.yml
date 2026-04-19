@@ -1,0 +1,139 @@
+title: Kernel Panic or Oops
+id: 5ee5f554-5555-8e55-e5e5-555555555555
+status: stable
+level: critical
+logsource:
+  product: linux
+  service: syslog
+detection:
+  selection:
+    message|contains:
+      - "kernel panic"
+      - "Kernel panic"
+      - "BUG:"
+      - "Oops:"
+      - "segfault"
+  condition: selection
+tags:
+  - attack.impact
+
+---
+
+title: OOM Killer Invoked
+id: 6ff6a665-6666-9f66-f6f6-666666666666
+status: stable
+level: high
+logsource:
+  product: linux
+  service: syslog
+detection:
+  selection:
+    message|contains:
+      - "Out of memory"
+      - "oom-kill"
+      - "oom_kill"
+      - "Killed process"
+  condition: selection
+tags:
+  - attack.impact
+
+---
+
+title: Systemd Service Crash Loop
+id: 7aa7b776-7777-af77-a7a7-777777777777
+status: stable
+level: high
+logsource:
+  product: linux
+  service: syslog
+detection:
+  selection:
+    program:
+      - systemd
+    message|contains:
+      - "entered failed state"
+      - "Start request repeated too quickly"
+      - "Failed with result"
+  condition: selection
+tags:
+  - attack.impact
+
+---
+
+title: Disk Space Critical
+id: 8bb8c887-8888-ba88-b8b8-888888888888
+status: test
+level: high
+logsource:
+  product: linux
+  service: syslog
+detection:
+  selection:
+    message|contains:
+      - "No space left on device"
+      - "filesystem is full"
+      - "disk space"
+  condition: selection
+tags:
+  - attack.impact
+
+---
+
+title: Crontab Modified
+id: 9cc9d998-9999-cb99-c9c9-999999999999
+status: stable
+level: medium
+logsource:
+  product: linux
+  service: syslog
+detection:
+  selection:
+    program:
+      - crontab
+      - CRON
+    message|contains:
+      - "REPLACE"
+      - "EDIT"
+      - "LIST"
+  condition: selection
+tags:
+  - attack.persistence
+  - attack.t1053
+
+---
+
+title: Container Crash or Restart
+id: add0eaa9-aaaa-dcaa-dada-aaaaaaaaaaaa
+status: stable
+level: medium
+logsource:
+  product: docker
+detection:
+  selection:
+    message|contains:
+      - "container died"
+      - "OOMKilled"
+      - "restart_policy"
+      - "unhealthy"
+      - "exited with code"
+  condition: selection
+tags:
+  - attack.impact
+
+---
+
+title: Nginx 5xx Server Error Spike
+id: bee1fbb0-bbbb-edbb-ebeb-bbbbbbbbbbbb
+status: test
+level: medium
+logsource:
+  product: webserver
+detection:
+  selection:
+    program:
+      - nginx
+    message|re:
+      - "\" 50[0-9] "
+  condition: selection
+tags:
+  - attack.impact

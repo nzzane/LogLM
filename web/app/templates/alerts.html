@@ -4,6 +4,99 @@
 {% block content %}
 <h1>Alert History</h1>
 
+<!-- Natural language rules panel -->
+<div class="card" style="margin-bottom:1.2rem;">
+  <div class="section-header" style="cursor:pointer;" onclick="toggleRulesPanel()">
+    <h2>⚙ Ignore / Importance Rules</h2>
+    <span id="rules-toggle-hint" style="font-size:.8rem;color:var(--fg-muted);">click to expand</span>
+  </div>
+  <div id="rules-panel" style="display:none;padding:.8rem 0 0;">
+    <p style="font-size:.85rem;color:var(--fg-muted);margin-bottom:.8rem;">
+      Describe what to ignore or flag important — the AI will create the matching rules automatically.
+    </p>
+    <div class="form-row" style="align-items:flex-start;gap:.5rem;">
+      <input id="nl-rule-input" type="text" style="flex:1;font-size:.85rem;"
+             placeholder='e.g. "ignore firewall blocks from internal devices" or "flag auth failures on server1 as important"'
+             onkeydown="if(event.key==='Enter')submitNLRule()">
+      <button class="btn" onclick="submitNLRule()" id="nl-rule-btn">Create Rule</button>
+    </div>
+    <div id="nl-rule-result" style="margin-top:.5rem;font-size:.82rem;"></div>
+    <div id="rules-list" style="margin-top:.8rem;"></div>
+  </div>
+</div>
+
+<script>
+async function toggleRulesPanel() {
+  const p = document.getElementById('rules-panel');
+  const h = document.getElementById('rules-toggle-hint');
+  if (p.style.display === 'none') {
+    p.style.display = 'block'; h.textContent = 'click to collapse';
+    await loadRules();
+  } else {
+    p.style.display = 'none'; h.textContent = 'click to expand';
+  }
+}
+
+async function loadRules() {
+  const r = await fetch('/api/rules');
+  const rules = await r.json();
+  const el = document.getElementById('rules-list');
+  if (!rules.length) { el.innerHTML = '<em style="color:var(--fg-muted)">No rules yet.</em>'; return; }
+  el.innerHTML = `<table style="width:100%;font-size:.78rem;border-collapse:collapse;">
+    <thead><tr style="opacity:.6;text-align:left;">
+      <th style="padding:.2rem .5rem;">Verdict</th><th>Host</th><th>Program</th>
+      <th>Pattern</th><th>Created</th><th></th>
+    </tr></thead><tbody>` +
+    rules.map(r => `<tr style="border-top:1px solid var(--border,#333);">
+      <td style="padding:.25rem .5rem;"><span class="badge badge-${r.verdict==='ignore'?'low':'high'}">${r.verdict}</span></td>
+      <td style="padding:.25rem .5rem;">${esc(r.host)||'<em>any</em>'}</td>
+      <td style="padding:.25rem .5rem;">${esc(r.program)||'<em>any</em>'}</td>
+      <td style="padding:.25rem .5rem;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(r.pattern)}">${esc(r.pattern)||'<em>*</em>'}</td>
+      <td style="padding:.25rem .5rem;color:var(--fg-muted);">${new Date(r.created_at).toLocaleDateString()}</td>
+      <td style="padding:.25rem .5rem;"><button class="btn ghost" style="font-size:.7rem;padding:.15rem .4rem;"
+        onclick="deleteRule(${r.id}, this)">Delete</button></td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function submitNLRule() {
+  const inp = document.getElementById('nl-rule-input');
+  const btn = document.getElementById('nl-rule-btn');
+  const res = document.getElementById('nl-rule-result');
+  const text = inp.value.trim();
+  if (!text) return;
+  btn.disabled = true; btn.textContent = 'Thinking…';
+  res.innerHTML = '';
+  try {
+    const r = await fetch('/api/rules/natural', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if (!r.ok) { res.innerHTML = `<span style="color:var(--danger)">Error: ${esc(d.detail||d.message||'unknown')}</span>`; return; }
+    res.innerHTML = `<span style="color:var(--success,#5a5)">✓ ${esc(d.summary)} (${d.inserted} rule${d.inserted!==1?'s':''})</span>`;
+    inp.value = '';
+    await loadRules();
+  } catch(e) {
+    res.innerHTML = `<span style="color:var(--danger)">Failed: ${esc(String(e))}</span>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create Rule';
+  }
+}
+
+async function deleteRule(id, btn) {
+  if (!confirm('Delete this rule?')) return;
+  btn.disabled = true;
+  const r = await fetch(`/api/rules/${id}`, {method:'DELETE'});
+  if (r.ok) await loadRules();
+  else { btn.disabled = false; alert('Delete failed'); }
+}
+</script>
+
 {% if alerts %}
   {% for alert in alerts %}
   <div class="alert-card {{ alert.severity }} {% if alert.acknowledged %}acked{% endif %}">
@@ -18,6 +111,9 @@
       {% if not alert.acknowledged %}
       <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
               onclick="ackAlert({{ alert.id }}, this)">Acknowledge</button>
+      <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
+              title="Acknowledge AND silence future matching events from the affected hosts"
+              onclick="ignoreWarning(this, {{ alert.id }})">Ack+Ignore</button>
       {% else %}
       <span class="text-muted" style="font-size:.75rem;">✓ Acknowledged</span>
       {% endif %}
@@ -34,6 +130,13 @@
     {% if alert.recommended_action %}
     <div class="alert-action">→ <strong>Action:</strong> {{ alert.recommended_action }}</div>
     {% endif %}
+    <div style="margin-top:.5rem;">
+      <button class="btn ghost" style="font-size:.7rem;padding:.2rem .5rem;" onclick="toggleDetail(this)">Show more</button>
+    </div>
+    <div class="alert-raw" style="display:none;margin-top:.5rem;">
+      <div style="font-size:.75rem;color:var(--fg-muted,#999);margin-bottom:.3rem;"><strong>LLM raw analysis</strong></div>
+      <pre style="white-space:pre-wrap;word-break:break-word;font-size:.72rem;background:var(--bg-inset,#1a1a2e);padding:.6rem;border-radius:6px;max-height:400px;overflow-y:auto;">{{ alert.raw_result | tojson(indent=2) if alert.raw_result else '(no raw data)' }}</pre>
+    </div>
   </div>
   {% endfor %}
 
@@ -52,4 +155,12 @@
 {% else %}
   <div class="empty-state card">No alerts yet — the LLM has found nothing suspicious.</div>
 {% endif %}
+
+<script>
+function toggleDetail(btn) {
+  var d = btn.parentElement.nextElementSibling;
+  if (d.style.display === 'none') { d.style.display = 'block'; btn.textContent = 'Show less'; }
+  else { d.style.display = 'none'; btn.textContent = 'Show more'; }
+}
+</script>
 {% endblock %}

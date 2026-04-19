@@ -1,0 +1,84 @@
+title: Port Scan Detected - Multiple Blocked Ports
+id: 1aa1b110-1111-4a11-a1a1-111111111111
+status: stable
+level: high
+logsource:
+  product: firewall
+detection:
+  selection:
+    message|contains:
+      - "DPT="
+      - "dst_port"
+    message|contains:
+      - "block"
+      - "drop"
+      - "denied"
+      - "reject"
+  condition: selection
+tags:
+  - attack.discovery
+  - attack.t1046
+
+---
+
+title: Outbound Connection to Unusual Port
+id: 2bb2c221-2222-5b22-b2b2-222222222222
+status: test
+level: medium
+logsource:
+  product: firewall
+detection:
+  selection:
+    message|contains:
+      - "DPT=4444"
+      - "DPT=5555"
+      - "DPT=6666"
+      - "DPT=8888"
+      - "DPT=9999"
+      - "DPT=1337"
+      - "DPT=31337"
+      - "dst_port\":4444"
+      - "dst_port\":5555"
+      - "dst_port\":1337"
+  condition: selection
+tags:
+  - attack.command_and_control
+  - attack.t1571
+
+---
+
+title: DNS Query to Known Malicious TLD
+id: 3cc3d332-3333-6c33-c3c3-333333333333
+status: test
+level: medium
+logsource:
+  product: dns
+detection:
+  selection:
+    message|contains:
+      - ".onion"
+      - ".bit"
+      - ".bazar"
+      - ".coin"
+  condition: selection
+tags:
+  - attack.command_and_control
+  - attack.t1071
+
+---
+
+title: DHCP Exhaustion - Rapid Requests
+id: 4dd4e443-4444-7d44-d4d4-444444444444
+status: test
+level: medium
+logsource:
+  product: dhcp
+detection:
+  selection:
+    message|contains:
+      - "DHCPDISCOVER"
+      - "DHCPREQUEST"
+  condition: selection
+tags:
+  - attack.impact
+  - attack.t1498

@@ -2,11 +2,17 @@ services:
 
   # ── Syslog receiver (pure Python, multi-arch) ───────────────────────────────
   syslog:
-    build: ./rsyslog
+    build:
+      context: .
+      dockerfile: rsyslog/Dockerfile
     container_name: loglm-syslog
     restart: unless-stopped
     environment:
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
+      GELF_ENABLED: ${GELF_ENABLED:-1}
+      GELF_PORT: ${GELF_PORT:-12201}
+      JSON_ENABLED: ${JSON_ENABLED:-1}
+      JSON_PORT: ${JSON_PORT:-5140}
       TZ: ${TZ:-UTC}
     networks:
       br0:
@@ -16,11 +22,13 @@ services:
 
   # ── SNMP trap receiver + active poller ──────────────────────────────────────
   snmp:
-    build: ./snmp
+    build:
+      context: .
+      dockerfile: snmp/Dockerfile
     container_name: loglm-snmp
     restart: unless-stopped
     environment:
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       SNMP_TARGETS: ${SNMP_TARGETS:-}
       SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
@@ -34,11 +42,14 @@ services:
 
   # ── Log processing pipeline ──────────────────────────────────────────────────
   processor:
-    build: ./processor
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
     container_name: loglm-processor
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       LOKI_URL: http://loki:3100
       LIBRENMS_URL: ${LIBRENMS_URL:-}
@@ -48,6 +59,11 @@ services:
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
       PROCESSOR_USE_FAST_LLM: ${PROCESSOR_USE_FAST_LLM:-0}
       TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9101/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
     networks:
       br0:
         ipv4_address: 10.20.10.102
@@ -58,11 +74,14 @@ services:
 
   # ── LLM anomaly analyzer + memory summariser ────────────────────────────────
   analyzer:
-    build: ./analyzer
+    build:
+      context: .
+      dockerfile: analyzer/Dockerfile
     container_name: loglm-analyzer
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
@@ -73,6 +92,11 @@ services:
       ANALYSIS_INTERVAL_SECONDS: ${ANALYSIS_INTERVAL_SECONDS:-60}
       MEMORY_INTERVAL_SECONDS: ${MEMORY_INTERVAL_SECONDS:-300}
       TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9102/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
     networks:
       br0:
         ipv4_address: 10.20.10.103
@@ -87,7 +111,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       LOKI_URL: http://loki:3100
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
@@ -96,8 +120,17 @@ services:
       LIBRENMS_URL: ${LIBRENMS_URL:-}
       LIBRENMS_TOKEN: ${LIBRENMS_TOKEN:-}
       SECRET_KEY: ${SECRET_KEY:-changeme-in-production}
+      LOGLM_BOOTSTRAP_ADMIN_PASSWORD: ${LOGLM_BOOTSTRAP_ADMIN_PASSWORD:-}
+      LOGLM_AUTH_DISABLED: ${LOGLM_AUTH_DISABLED:-0}
+      LOGLM_AUTH_TRUST_LOOPBACK: ${LOGLM_AUTH_TRUST_LOOPBACK:-1}
+      LOGLM_SESSION_HOURS: ${LOGLM_SESSION_HOURS:-24}
       TZ: ${TZ:-UTC}
       NTP_SERVER: ${NTP_SERVER:-pool.ntp.org}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8000/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -138,6 +171,11 @@ services:
     volumes:
       - ${STORAGE_PATH:-./data}/postgres:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loglm"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     networks:
       br0:
         ipv4_address: 10.20.10.106
@@ -151,7 +189,14 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ${STORAGE_PATH:-./data}/redis:/data
-    command: redis-server --save 60 1 --loglevel warning
+    command: >-
+      redis-server --save 60 1 --loglevel warning
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a ${REDIS_PASSWORD}} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     networks:
       br0:
         ipv4_address: 10.20.10.107

@@ -23,6 +23,20 @@
   </div>
 
   <div class="card host-tags-card">
+    <div class="section-header"><h2>Host Type</h2></div>
+    <div class="form-row" style="align-items:center;gap:.5rem;margin-bottom:.5rem;">
+      <select id="host-type-select" style="flex:1;">
+        {% for t in host_types %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+      <button id="host-type-save" class="btn secondary" style="font-size:.8rem;">Save</button>
+      <span id="host-type-msg" class="text-muted" style="font-size:.8rem;"></span>
+    </div>
+    <p style="font-size:.75rem;color:var(--fg-muted);margin:.3rem 0 .8rem;">
+      Type controls which analysis stream this host's events use (syslog / snmp / nginx).
+    </p>
+
     <div class="section-header"><h2>Tags</h2></div>
     <div id="tag-list" class="tag-list"></div>
     <div class="tag-add-row">
@@ -59,6 +73,9 @@
 <script>
 (function() {
   const HOST = {{ host | tojson }};
+  const hostTypeSelect = document.getElementById('host-type-select');
+  const hostTypeSave = document.getElementById('host-type-save');
+  const hostTypeMsg = document.getElementById('host-type-msg');
   const tagList = document.getElementById('tag-list');
   const tagInput = document.getElementById('tag-input');
   const tagAdd = document.getElementById('tag-add');
@@ -130,6 +147,15 @@
     } catch (e) { alert('remove failed: ' + e); }
   }
 
+  hostTypeSave.addEventListener('click', async () => {
+    hostTypeMsg.textContent = 'saving…';
+    try {
+      await saveMetadata({host_type: hostTypeSelect.value});
+      hostTypeMsg.textContent = '✓ saved';
+      setTimeout(() => hostTypeMsg.textContent = '', 1800);
+    } catch (e) { hostTypeMsg.textContent = 'error'; }
+  });
+
   tagAdd.addEventListener('click', () => addTag(tagInput.value));
   tagInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); addTag(tagInput.value); }
@@ -167,18 +193,81 @@
     `;
   }
 
+  function fmtBps(v) {
+    if (v == null) return '—';
+    if (v >= 1e9) return (v/1e9).toFixed(1) + ' GB/s';
+    if (v >= 1e6) return (v/1e6).toFixed(1) + ' MB/s';
+    if (v >= 1e3) return (v/1e3).toFixed(1) + ' KB/s';
+    return Math.round(v) + ' B/s';
+  }
+
   function renderSnmp(m) {
     if (!m) { snmpBlock.textContent = 'no SNMP data'; return; }
     const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : '?';
+
+    // ── Summary line ────────────────────────────────────────────────────────
     const parts = [];
     if (m.sys_name) parts.push(`<strong>${escapeHtml(m.sys_name)}</strong>`);
     if (m.avg_cpu != null) parts.push(`CPU ${m.avg_cpu}%`);
-    parts.push(`if ${m.interfaces_up||0}up / ${m.interfaces_down||0}down`);
-    if (m.wifi_clients) parts.push(`${m.wifi_clients} wifi clients`);
-    if (m.total_in_bps) parts.push(`in ${Math.round(m.total_in_bps)} B/s`);
-    if (m.total_out_bps) parts.push(`out ${Math.round(m.total_out_bps)} B/s`);
+    parts.push(`if ${m.interfaces_up||0}↑ / ${m.interfaces_down||0}↓`);
+    if (m.wifi_clients) parts.push(`${m.wifi_clients} wifi`);
+    if (m.total_in_bps) parts.push(`↓${fmtBps(m.total_in_bps)}`);
+    if (m.total_out_bps) parts.push(`↑${fmtBps(m.total_out_bps)}`);
     if (m.total_errors) parts.push(`<span class="bad">${m.total_errors.toFixed(1)} err/s</span>`);
-    snmpBlock.innerHTML = parts.join(' \u00b7 ') + `<div class="text-muted small">${ts}</div>`;
+
+    let html = `<div>${parts.join(' · ')}</div><div class="text-muted small">${ts}</div>`;
+
+    // ── Per-interface table (only show up interfaces with traffic data) ──────
+    const ifaces = m.interfaces || {};
+    const ifRows = Object.values(ifaces)
+      .filter(i => i.oper_status === 'up' || i.in_bytes_per_sec != null)
+      .sort((a,b) => (a.name||'').localeCompare(b.name||''));
+    if (ifRows.length) {
+      html += `<details style="margin-top:.5rem;"><summary class="text-muted small" style="cursor:pointer;">
+        Interfaces (${ifRows.length})</summary>
+        <table class="snmp-if-table" style="width:100%;font-size:.78rem;margin-top:.3rem;">
+          <thead><tr><th>Port</th><th>Status</th><th>↓ in</th><th>↑ out</th><th>Speed</th></tr></thead>
+          <tbody>
+        ${ifRows.map(i => {
+          const alias = escapeHtml(i.name || i.descr || '—');
+          const st = i.oper_status === 'up'
+            ? '<span style="color:var(--ok)">up</span>'
+            : '<span class="bad">down</span>';
+          const inbps  = fmtBps(i.in_bytes_per_sec);
+          const outbps = fmtBps(i.out_bytes_per_sec);
+          const spd    = i.speed_mbps ? `${i.speed_mbps} Mbps` : '—';
+          const errBit = (i.in_errors_per_sec || 0) + (i.out_errors_per_sec || 0) > 0
+            ? ' <span class="bad" title="errors">!</span>' : '';
+          return `<tr><td>${alias}${errBit}</td><td>${st}</td><td>${inbps}</td><td>${outbps}</td><td class="text-muted">${spd}</td></tr>`;
+        }).join('')}
+          </tbody>
+        </table></details>`;
+    }
+
+    // ── SFP sensors ─────────────────────────────────────────────────────────
+    const sfp = (m.sfp_sensors || []).filter(s => s.is_sfp);
+    if (sfp.length) {
+      const rows = sfp.map(s => {
+        const val   = s.type === 'temperature'
+          ? `${s.value.toFixed(1)} ${s.unit}`
+          : `${s.value.toFixed(2)} ${s.unit}`;
+        let cls = '';
+        if (s.type === 'temperature' && s.value >= 85) cls = 'bad';
+        else if (s.type === 'temperature' && s.value >= 70) cls = 'warn';
+        else if (s.type === 'optical_power' && s.value < -20) cls = 'warn';
+        return `<tr><td>${escapeHtml(s.name)}</td>
+                    <td class="${cls}">${val}</td>
+                    <td class="text-muted">${escapeHtml(s.descr||'')}</td></tr>`;
+      }).join('');
+      html += `<details style="margin-top:.5rem;"><summary class="text-muted small" style="cursor:pointer;">
+        SFP / optical sensors (${sfp.length})</summary>
+        <table class="snmp-if-table" style="width:100%;font-size:.78rem;margin-top:.3rem;">
+          <thead><tr><th>Sensor</th><th>Value</th><th>Description</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></details>`;
+    }
+
+    snmpBlock.innerHTML = html;
   }
 
   function renderAlerts(alerts) {
@@ -233,6 +322,7 @@
       pinBtn.textContent = pinned ? 'Unpin' : 'Pin';
       pinBtn.classList.toggle('active', pinned);
       notes.value = d.metadata.notes || '';
+      if (d.metadata.host_type) hostTypeSelect.value = d.metadata.host_type;
       renderTags();
       renderStats(d.stats || {}, d.alias, d.device && d.device.label);
       renderSnmp(d.snmp_latest);

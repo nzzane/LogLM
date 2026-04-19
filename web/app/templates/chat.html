@@ -21,22 +21,20 @@
   <div class="chat-main">
     <div class="chat-messages" id="chat-messages">
       {% if not messages %}
-      <div class="chat-empty">
-        <div style="font-size:1.5rem;margin-bottom:.5rem;color:var(--accent);">LogLM Chat</div>
-        <p class="text-muted">Ask me about your network. I have memory of recent events, SNMP metrics, and alerts.</p>
-        <div class="chat-suggestions">
-          <button class="btn secondary" onclick="sendSuggestion('What happened in the last hour?')">What happened in the last hour?</button>
-          <button class="btn secondary" onclick="sendSuggestion('Anything look different or unusual?')">Anything look different?</button>
-          <button class="btn secondary" onclick="sendSuggestion('How are the routers and APs doing?')">How are the routers and APs?</button>
-          <button class="btn secondary" onclick="sendSuggestion('Summarise today\\'s alerts')">Summarise today's alerts</button>
-          <button class="btn secondary" onclick="sendSuggestion('Any suspicious activity?')">Any suspicious activity?</button>
-        </div>
-      </div>
+      <div id="empty-state-mount"></div>
       {% else %}
         {% for m in messages %}
         <div class="chat-msg {{ m.role }}">
           <div class="chat-msg-header">
-            {% if m.role == 'user' %}You{% else %}LogLM{% endif %}
+            {% if m.role == 'user' %}You
+            {% elif m.mode == 'deep' %}LogLM Investigator
+            {% else %}LogLM
+            {% endif %}
+            {% if m.role == 'assistant' and m.mode %}
+              <span class="msg-mode-badge {{ m.mode }}">
+                {{ '🔍 Investigate' if m.mode == 'deep' else '⚡ Quick' }}
+              </span>
+            {% endif %}
             <span class="text-muted" style="font-size:.7rem;margin-left:.5rem;">{{ m.created_at.strftime('%H:%M:%S') }}</span>
           </div>
           <div class="chat-msg-body">{{ m.content }}</div>
@@ -47,6 +45,15 @@
 
     <!-- Input -->
     <div class="chat-input-area">
+      <div class="chat-mode-bar">
+        <button class="mode-btn active" id="mode-quick" onclick="setMode('quick')"
+                title="Fast answers: stats, alerts, current state">⚡ Quick</button>
+        <button class="mode-btn" id="mode-deep" onclick="setMode('deep')"
+                title="Full investigation: cross-source correlation, causal chains, IP resolution">🔍 Investigate</button>
+        <span id="mode-hint" class="text-muted" style="font-size:.72rem;margin-left:.5rem;">
+          Stats &amp; current state
+        </span>
+      </div>
       <form id="chat-form" onsubmit="sendMessage(event)">
         <div class="chat-input-row">
           <input type="text" id="chat-input" placeholder="Ask about your network..."
@@ -186,6 +193,42 @@
 }
 #chat-send:disabled { opacity: .5; cursor: not-allowed; }
 
+.chat-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  margin-bottom: .5rem;
+}
+.mode-btn {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: .75rem;
+  padding: .25rem .75rem;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.mode-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.mode-btn:hover:not(.active) { background: var(--bg4, var(--bg3)); color: var(--text); }
+
+.chat-msg .msg-mode-badge {
+  display: inline-block;
+  font-size: .6rem;
+  padding: .1rem .4rem;
+  border-radius: 10px;
+  margin-left: .4rem;
+  vertical-align: middle;
+  opacity: .8;
+}
+.msg-mode-badge.quick      { background: var(--bg3); color: var(--text-muted); }
+.msg-mode-badge.deep       { background: #1a2e40; color: #6bbfff; }
+
 .typing-indicator {
   display: inline-flex;
   gap: 4px;
@@ -209,23 +252,67 @@
 {% block scripts %}
 <script>
 let currentSessionId = "{{ session_id }}";
+let chatMode = 'quick';
+
+const MODE_META = {
+  quick: {
+    hint: 'Stats &amp; current state',
+    placeholder: 'Ask about your network...',
+    agentName: 'LogLM',
+    suggestions: [
+      "What happened in the last hour?",
+      "Anything look different or unusual?",
+      "How are the routers and APs?",
+      "Summarise today's alerts",
+      "Any suspicious activity?",
+    ],
+  },
+  deep: {
+    hint: 'Cross-source investigation &amp; causal chains',
+    placeholder: 'What just happened? Investigate an incident...',
+    agentName: 'LogLM Investigator',
+    suggestions: [
+      "What just happened?",
+      "Investigate the last 30 minutes",
+      "Why did [device] go offline?",
+      "Trace what happened at 3am",
+      "Which devices are connected to the router?",
+      "Link the IPs I'm seeing in the firewall logs to actual hosts",
+    ],
+  },
+};
+
+function setMode(mode) {
+  chatMode = mode;
+  document.getElementById('mode-quick').classList.toggle('active', mode === 'quick');
+  document.getElementById('mode-deep').classList.toggle('active',  mode === 'deep');
+  const meta = MODE_META[mode];
+  document.getElementById('mode-hint').innerHTML = meta.hint;
+  document.getElementById('chat-input').placeholder = meta.placeholder;
+}
 
 function scrollToBottom() {
   const el = document.getElementById('chat-messages');
   el.scrollTop = el.scrollHeight;
 }
 
-function appendMessage(role, content) {
+function appendMessage(role, content, mode) {
   const container = document.getElementById('chat-messages');
   // Remove empty state if present
   const empty = container.querySelector('.chat-empty');
   if (empty) empty.remove();
 
+  const meta = MODE_META[mode || 'quick'];
+  const agentName = role === 'user' ? 'You' : (meta.agentName || 'LogLM');
+  const badge = (role === 'assistant' && mode)
+    ? `<span class="msg-mode-badge ${mode}">${mode === 'deep' ? '🔍 Investigate' : '⚡ Quick'}</span>`
+    : '';
+
   const div = document.createElement('div');
   div.className = `chat-msg ${role}`;
   const time = new Date().toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
   div.innerHTML = `
-    <div class="chat-msg-header">${role === 'user' ? 'You' : 'LogLM'}
+    <div class="chat-msg-header">${agentName}${badge}
       <span class="text-muted" style="font-size:.7rem;margin-left:.5rem;">${time}</span>
     </div>
     <div class="chat-msg-body">${escHtml(content)}</div>
@@ -257,57 +344,114 @@ async function sendMessage(e) {
   if (!msg) return;
 
   input.value = '';
-  appendMessage('user', msg);
+  appendMessage('user', msg, chatMode);
 
   const btn = document.getElementById('chat-send');
   btn.disabled = true;
   showTyping();
 
-  try {
-    const resp = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: currentSessionId || null, message: msg}),
-    });
-    const data = await resp.json();
+  if (typeof sendChatStreaming === 'function') {
     removeTyping();
+    const msgDiv = appendMessage('assistant', '', chatMode);
+    const bodyEl = msgDiv.querySelector('.chat-msg-body');
+    let fullText = '';
+    const sendMode = chatMode;
 
-    if (!currentSessionId && data.session_id) {
-      currentSessionId = data.session_id;
-      history.replaceState(null, '', `/chat?session_id=${currentSessionId}`);
+    sendChatStreaming(msg, currentSessionId || null, sendMode,
+      function onToken(token) {
+        fullText += token;
+        bodyEl.textContent = fullText;
+        scrollToBottom();
+      },
+      function onDone(sid) {
+        if (!currentSessionId && sid) {
+          currentSessionId = sid;
+          history.replaceState(null, '', `/chat?session_id=${currentSessionId}`);
+        }
+        btn.disabled = false;
+        input.focus();
+      },
+      function onError(err) {
+        if (!fullText) bodyEl.textContent = 'Error: ' + err;
+        btn.disabled = false;
+        input.focus();
+      }
+    );
+  } else {
+    const sendMode = chatMode;
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({session_id: currentSessionId || null, message: msg, mode: sendMode}),
+      });
+      const data = await resp.json();
+      removeTyping();
+
+      if (!currentSessionId && data.session_id) {
+        currentSessionId = data.session_id;
+        history.replaceState(null, '', `/chat?session_id=${currentSessionId}`);
+      }
+
+      appendMessage('assistant', data.response || 'No response', data.mode || sendMode);
+    } catch (err) {
+      removeTyping();
+      appendMessage('assistant', 'Error communicating with server: ' + err.message, sendMode);
+    } finally {
+      btn.disabled = false;
+      input.focus();
     }
-
-    appendMessage('assistant', data.response || 'No response');
-  } catch (err) {
-    removeTyping();
-    appendMessage('assistant', 'Error communicating with server: ' + err.message);
-  } finally {
-    btn.disabled = false;
-    input.focus();
   }
 }
 
-function sendSuggestion(text) {
+function sendSuggestion(text, mode) {
+  if (mode) setMode(mode);
   document.getElementById('chat-input').value = text;
   sendMessage(null);
+}
+
+function renderEmptyState() {
+  const meta = MODE_META[chatMode];
+  const suggButtons = meta.suggestions.map(s =>
+    `<button class="btn secondary" onclick="sendSuggestion(${JSON.stringify(s)})">${escHtml(s)}</button>`
+  ).join('');
+  return `
+    <div class="chat-empty">
+      <div style="font-size:1.5rem;margin-bottom:.5rem;color:var(--accent);">LogLM Chat</div>
+      <p class="text-muted">Ask me about your network. I have memory of recent events, SNMP metrics, and alerts.</p>
+      <div style="margin:.75rem 0;display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center;">
+        <button class="mode-btn ${chatMode==='quick'?'active':''}" onclick="setMode('quick');renderSuggestions()">⚡ Quick</button>
+        <button class="mode-btn ${chatMode==='deep'?'active':''}"  onclick="setMode('deep');renderSuggestions()">🔍 Investigate</button>
+      </div>
+      <div class="chat-suggestions" id="empty-suggestions">${suggButtons}</div>
+    </div>
+  `;
+}
+
+function renderSuggestions() {
+  const el = document.getElementById('empty-suggestions');
+  if (!el) return;
+  const meta = MODE_META[chatMode];
+  el.innerHTML = meta.suggestions.map(s =>
+    `<button class="btn secondary" onclick="sendSuggestion(${JSON.stringify(s)})">${escHtml(s)}</button>`
+  ).join('');
 }
 
 async function newSession() {
   currentSessionId = '';
   history.replaceState(null, '', '/chat');
   const container = document.getElementById('chat-messages');
-  container.innerHTML = `
-    <div class="chat-empty">
-      <div style="font-size:1.5rem;margin-bottom:.5rem;color:var(--accent);">LogLM Chat</div>
-      <p class="text-muted">Ask me about your network.</p>
-    </div>
-  `;
+  container.innerHTML = renderEmptyState();
   document.getElementById('chat-input').focus();
 }
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+// Render initial empty state with correct mode suggestions
+const _emptyMount = document.getElementById('empty-state-mount');
+if (_emptyMount) _emptyMount.outerHTML = renderEmptyState();
 
 scrollToBottom();
 </script>

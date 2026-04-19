@@ -20,15 +20,25 @@
   </div>
 </div>
 
+<!-- Event rate sparkline -->
+<div class="card" style="padding:.5rem 1rem;margin-bottom:1rem;">
+  <div style="display:flex;align-items:center;gap:.5rem;">
+    <span class="text-muted" style="font-size:.75rem;">Events/min (4h)</span>
+    <canvas id="sparkline-events" width="600" height="40" style="flex:1;max-height:40px;"></canvas>
+  </div>
+</div>
+
 <!-- Active warnings panel -->
 <div class="section-header">
   <h2>Systems with active warnings</h2>
-  <a href="/alerts" class="text-muted" style="font-size:.75rem;">View all →</a>
+  <span class="text-muted small" id="warnings-refresh-state" style="font-size:.7rem;"></span>
+  <a href="/alerts" class="text-muted" style="font-size:.75rem;margin-left:auto;">View all →</a>
 </div>
+<div id="warnings-mount">
 {% if warnings %}
 <div class="warnings-grid">
   {% for w in warnings %}
-  <div class="warning-card {{ w.severity }}">
+  <div class="warning-card {{ w.severity }}" data-alert-id="{{ w.id }}">
     <div class="warning-head">
       <span class="badge badge-{{ w.severity }}">{{ w.severity }}</span>
       <span class="warning-hosts">
@@ -42,8 +52,13 @@
     <div class="warning-desc">{{ (w.description or '')[:160] }}{% if w.description and w.description|length > 160 %}…{% endif %}</div>
     <div class="warning-foot">
       {% if w.last_seen %}<span>{{ w.last_seen.strftime('%m-%d %H:%M') }}</span>{% endif %}
-      <button class="btn secondary" style="font-size:.7rem;padding:.15rem .5rem;"
-              onclick="ackAlert({{ w.id }}, this)">Ack</button>
+      <span class="warning-actions">
+        <button class="btn secondary" style="font-size:.7rem;padding:.15rem .5rem;"
+                onclick="ackWarning(this, {{ w.id }})">Ack</button>
+        <button class="btn secondary" style="font-size:.7rem;padding:.15rem .5rem;"
+                title="Acknowledge AND silence all future matching events"
+                onclick="ignoreWarning(this, {{ w.id }})">Ack+Ignore</button>
+      </span>
     </div>
   </div>
   {% endfor %}
@@ -51,6 +66,7 @@
 {% else %}
 <div class="card empty-state">No active warnings — all systems nominal.</div>
 {% endif %}
+</div>
 
 <!-- Service status -->
 {% if services %}
@@ -111,6 +127,37 @@
       <h2>Live Feed</h2>
       <span class="text-muted" style="font-size:.75rem;">security &amp; error events only</span>
     </div>
+    <div class="live-filter-bar" style="display:flex;gap:.4rem;margin-bottom:.5rem;flex-wrap:wrap;">
+      <input type="text" id="filter-host" placeholder="Host" style="flex:1;min-width:80px;padding:.2rem .4rem;font-size:.75rem;background:var(--bg-card);color:var(--fg);border:1px solid var(--border);border-radius:4px;">
+      <input type="text" id="filter-search" placeholder="Search message" style="flex:2;min-width:100px;padding:.2rem .4rem;font-size:.75rem;background:var(--bg-card);color:var(--fg);border:1px solid var(--border);border-radius:4px;">
+      <select id="filter-severity" style="padding:.2rem .4rem;font-size:.75rem;background:var(--bg-card);color:var(--fg);border:1px solid var(--border);border-radius:4px;">
+        <option value="">All severities</option>
+        <option value="emerg">emerg</option>
+        <option value="alert">alert</option>
+        <option value="crit">crit</option>
+        <option value="err">err</option>
+        <option value="warning">warning</option>
+        <option value="notice">notice</option>
+        <option value="info">info</option>
+      </select>
+      <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;" onclick="applyLiveFilter()">Filter</button>
+      <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;" onclick="clearLiveFilter()">Clear</button>
+    </div>
+    <script>
+      function applyLiveFilter() {
+        setLiveFilter({
+          host: document.getElementById('filter-host').value,
+          search: document.getElementById('filter-search').value,
+          severity: document.getElementById('filter-severity').value,
+        });
+      }
+      function clearLiveFilter() {
+        document.getElementById('filter-host').value = '';
+        document.getElementById('filter-search').value = '';
+        document.getElementById('filter-severity').value = '';
+        setLiveFilter({});
+      }
+    </script>
     <div id="live-feed">
       {% for event in events %}
       <div class="log-line"

@@ -13,9 +13,23 @@ The filter returns one of three verdicts:
   "drop"  — discard entirely
 """
 
+import ipaddress
 import re
 import time
 from collections import defaultdict
+
+# Fast RFC1918 check — avoids ipaddress overhead on hot path.
+_RFC1918 = (
+    "10.", "192.168.",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+    "127.", "169.254.", "::1", "fc", "fd",
+)
+
+
+def _is_private_fast(ip: str) -> bool:
+    return bool(ip) and ip.startswith(_RFC1918)
 
 # ── Patterns that are ALWAYS kept (security / critical) ────────────────────────
 ALWAYS_KEEP: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
@@ -232,9 +246,19 @@ def classify(event: dict) -> str:
     if fb is not None:
         return fb
 
-    # 1. ALWAYS_KEEP wins over everything
+    # 1. ALWAYS_KEEP wins over everything — but firewall POLICY blocks from
+    # internal (RFC1918) sources are normal managed access control. Those get
+    # downgraded to "store" so they land in the log browser without flooding the
+    # LLM analysis queue and causing false "port scan / upstream outage" alerts.
     for pattern in ALWAYS_KEEP:
         if pattern.search(msg):
+            s = event.get("structured") or {}
+            if s.get("type") == "firewall_event" and s.get("blocked"):
+                direction = s.get("direction", "")
+                src_ip = s.get("src_ip", "")
+                if direction in ("outbound", "internal") and _is_private_fast(src_ip):
+                    # Private source blocked outbound/laterally = policy block, not attack
+                    return "store"
             return "keep"
 
     # 2. ALWAYS_DROP

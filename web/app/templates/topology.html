@@ -21,8 +21,8 @@
   <div id="selection-panel" class="text-muted">click a node or edge</div>
 </div>
 
-<link rel="stylesheet" href="https://unpkg.com/vis-network/styles/vis-network.min.css">
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<link rel="stylesheet" href="/static/css/vis-network.min.css">
+<script src="/static/js/vis-network.min.js"></script>
 <script>
 (function() {
   const ICONS = {{ icons | tojson }};
@@ -109,12 +109,32 @@
       const d = await r.json();
       nodesDS.clear();
       edgesDS.clear();
-      nodesDS.add((d.nodes || []).map(nodeForServer));
-      edgesDS.add((d.edges || []).map(edgeForServer));
-      status.textContent = `${d.nodes.length} nodes, ${d.edges.length} edges`;
+      // Defensive dedupe: the backend already dedupes but a stale schema could
+      // still hand us duplicate hosts. vis-network throws on dup ids, which
+      // would break the whole page, so filter them out here too.
+      const seenNode = new Set();
+      const nodeItems = [];
+      for (const n of (d.nodes || [])) {
+        if (!n || !n.host || seenNode.has(n.host)) continue;
+        seenNode.add(n.host);
+        try { nodeItems.push(nodeForServer(n)); } catch (e) { console.warn('bad node', n, e); }
+      }
+      const seenEdge = new Set();
+      const edgeItems = [];
+      for (const e of (d.edges || [])) {
+        const id = e && e.id;
+        if (id == null || seenEdge.has(id)) continue;
+        if (!seenNode.has(e.from_host) || !seenNode.has(e.to_host)) continue;
+        seenEdge.add(id);
+        try { edgeItems.push(edgeForServer(e)); } catch (err) { console.warn('bad edge', e, err); }
+      }
+      nodesDS.add(nodeItems);
+      edgesDS.add(edgeItems);
+      status.textContent = `${nodeItems.length} nodes, ${edgeItems.length} edges`;
       if (network) network.fit();
     } catch (e) {
       status.textContent = 'error: ' + e;
+      console.error('topology load failed', e);
     }
   }
 

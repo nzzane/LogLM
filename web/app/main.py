@@ -23,12 +23,14 @@ from typing import AsyncGenerator
 import asyncpg
 import httpx
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Request, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request, Form, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+
+from app import auth, observability
 
 try:
     import docker as docker_sdk
@@ -41,10 +43,16 @@ except ImportError:
 POSTGRES_DSN = os.environ["POSTGRES_DSN"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
 LIBRENMS_URL = os.environ.get("LIBRENMS_URL", "")
 LIBRENMS_TOKEN = os.environ.get("LIBRENMS_TOKEN", "")
-# Chat uses the deep model for reasoning + correlation. Falls back to legacy OLLAMA_MODEL.
+# Quick mode: small fast model for stats/alerts queries
 OLLAMA_MODEL = os.environ.get(
+    "OLLAMA_MODEL_DEEP",
+    os.environ.get("OLLAMA_MODEL", "llama3.2:3b"),
+)
+# Investigator mode: larger model for cross-source correlation
+OLLAMA_MODEL_DEEP = os.environ.get(
     "OLLAMA_MODEL_DEEP",
     os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M"),
 )
@@ -57,6 +65,7 @@ APP_TZ = os.environ.get("TZ", "UTC")
 NTP_SERVER = os.environ.get("NTP_SERVER", "pool.ntp.org")
 
 app = FastAPI(title="LogLM")
+app.middleware("http")(observability.metrics_middleware)
 templates = Jinja2Templates(directory="app/templates")
 
 
@@ -136,14 +145,17 @@ async def startup():
 
             CREATE TABLE IF NOT EXISTS host_metadata (
                 host        TEXT PRIMARY KEY,
+                host_type   TEXT NOT NULL DEFAULT 'auto',
                 tags        TEXT[] NOT NULL DEFAULT '{}',
                 notes       TEXT,
                 pinned      BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at  TIMESTAMPTZ DEFAULT NOW(),
                 updated_at  TIMESTAMPTZ DEFAULT NOW()
             );
+            ALTER TABLE host_metadata ADD COLUMN IF NOT EXISTS host_type TEXT NOT NULL DEFAULT 'auto';
             CREATE INDEX IF NOT EXISTS idx_host_metadata_pinned ON host_metadata (pinned) WHERE pinned;
             CREATE INDEX IF NOT EXISTS idx_host_metadata_tags   ON host_metadata USING GIN (tags);
+            CREATE INDEX IF NOT EXISTS idx_host_metadata_type   ON host_metadata (host_type);
 
             CREATE TABLE IF NOT EXISTS topology_nodes (
                 host        TEXT PRIMARY KEY,
@@ -212,6 +224,44 @@ async def startup():
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages (session_id, created_at);
+            -- Store which chat mode was used per message (quick/deep)
+            ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'quick';
+
+            -- Topology tables (may be created by processor; ensure they exist here too)
+            CREATE TABLE IF NOT EXISTS host_ip_map (
+                ip          TEXT        NOT NULL,
+                host        TEXT        NOT NULL,
+                confidence  FLOAT       NOT NULL DEFAULT 1.0,
+                source      TEXT        NOT NULL DEFAULT 'unknown',
+                first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ip, host)
+            );
+            CREATE INDEX IF NOT EXISTS idx_host_ip_map_ip   ON host_ip_map (ip);
+            CREATE INDEX IF NOT EXISTS idx_host_ip_map_host ON host_ip_map (host);
+
+            CREATE TABLE IF NOT EXISTS topology_learned (
+                id           SERIAL PRIMARY KEY,
+                src_host     TEXT        NOT NULL,
+                dst_host     TEXT        NOT NULL,
+                relationship TEXT        NOT NULL,
+                evidence     TEXT,
+                confidence   FLOAT       NOT NULL DEFAULT 0.5,
+                event_count  INT         NOT NULL DEFAULT 1,
+                first_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (src_host, dst_host, relationship)
+            );
+            CREATE INDEX IF NOT EXISTS idx_topology_src ON topology_learned (src_host);
+
+            -- Speed up the "last N hours + severity filter" queries that the
+            -- dashboard, chat context, and log browser hit on every page load.
+            -- (timestamp DESC, severity) lets the planner satisfy both the
+            -- range scan and the severity filter from the index alone.
+            CREATE INDEX IF NOT EXISTS idx_events_ts_sev
+                ON events (timestamp DESC, severity);
+            CREATE INDEX IF NOT EXISTS idx_alerts_unacked_ls
+                ON alerts (last_seen DESC) WHERE NOT acknowledged;
         """)
     _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     _http = httpx.AsyncClient(
@@ -223,6 +273,13 @@ async def startup():
         timeout=httpx.Timeout(300.0, connect=5.0),
     )
 
+    app.state.pool = _pool
+    app.state.redis = _redis
+    app.state.http = _http
+
+    observability.install(app, OLLAMA_URL, LOKI_URL)
+    await auth.bootstrap_admin(_pool)
+
     global _docker
     if docker_sdk is not None:
         try:
@@ -233,6 +290,27 @@ async def startup():
             print(f"[web] docker socket unavailable: {e}")
 
 
+_AUTH_OPEN_PATHS = {"/login", "/healthz", "/readyz", "/metrics"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in _AUTH_OPEN_PATHS or path.startswith("/static"):
+        return await call_next(request)
+    try:
+        principal = await auth.current_user(request)
+        request.state.user = principal
+    except HTTPException:
+        if path.startswith("/api/"):
+            raise
+        return RedirectResponse("/login", status_code=303)
+    if request.method in auth.CSRF_METHODS:
+        await auth.csrf_guard(request)
+    response = await call_next(request)
+    return response
+
+
 @app.on_event("shutdown")
 async def shutdown():
     if _pool:
@@ -241,6 +319,50 @@ async def shutdown():
         await _redis.aclose()
     if _http:
         await _http.aclose()
+
+
+# ── Auth routes ───────────────────────────────────────────────────────────────
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
+
+
+@app.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    await auth.rate_limit(request, "login", 10, 60)
+    ip = auth._client_ip(request)
+    ua = request.headers.get("user-agent")
+    result = await auth.login_user(_pool, username, password, ip, ua)
+    if result is None:
+        return templates.TemplateResponse("login.html", {
+            "request": request, "error": "Invalid credentials",
+        }, status_code=401)
+    cookie_val, principal = result
+    await auth.audit(_pool, principal, "login", ip=ip)
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(
+        auth.SESSION_COOKIE, cookie_val, httponly=True, samesite="lax",
+        max_age=int(auth.SESSION_LIFETIME.total_seconds()),
+    )
+    csrf = auth.issue_csrf_token()
+    auth.set_csrf_cookie(resp, csrf)
+    return resp
+
+
+@app.post("/logout")
+async def logout_submit(request: Request):
+    cookie_val = request.cookies.get(auth.SESSION_COOKIE)
+    if cookie_val:
+        await auth.logout_session(_pool, cookie_val)
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(auth.SESSION_COOKIE)
+    resp.delete_cookie(auth.CSRF_COOKIE)
+    return resp
 
 
 # ── SSE realtime stream ───────────────────────────────────────────────────────
@@ -261,23 +383,120 @@ async def event_generator() -> AsyncGenerator[str, None]:
         await pubsub.aclose()
 
 
+@app.get("/api/event-rate")
+async def event_rate(hours: int = Query(default=4, le=24)):
+    """Per-minute event counts for the last N hours. Used for dashboard sparkline."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT date_trunc('minute', timestamp) AS minute,
+                   COUNT(*) AS cnt,
+                   COUNT(*) FILTER (WHERE severity IN ('emerg','alert','crit','err','error')) AS errors
+            FROM events
+            WHERE timestamp > NOW() - ($1 * INTERVAL '1 hour')
+            GROUP BY 1 ORDER BY 1
+        """, hours)
+    return JSONResponse({
+        "points": [
+            {"t": r["minute"].isoformat(), "count": r["cnt"], "errors": r["errors"]}
+            for r in rows
+        ]
+    })
+
+
 @app.get("/api/stream")
 async def stream():
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ── WebSocket live feed with filtering ────────────────────────────────────────
+
+@app.websocket("/ws/events")
+async def ws_events(websocket: WebSocket):
+    """WebSocket live event feed. Client can send JSON filter commands:
+      {"filter": {"host": "router", "severity": "err", "search": "ssh"}}
+      {"filter": null}  — clear filters
+    """
+    await websocket.accept()
+    filters: dict = {}
+
+    async def _reader():
+        nonlocal filters
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if "filter" in msg:
+                    filters = msg["filter"] or {}
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    async def _writer():
+        pubsub = _redis.pubsub()
+        await pubsub.subscribe("loglm:events")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    try:
+                        event = json.loads(msg["data"])
+                    except json.JSONDecodeError:
+                        continue
+                    if _ws_matches(event, filters):
+                        await websocket.send_text(msg["data"])
+                else:
+                    await websocket.send_text('{"keepalive":true}')
+                await asyncio.sleep(0.05)
+        finally:
+            await pubsub.unsubscribe("loglm:events")
+            await pubsub.aclose()
+
+    reader_task = asyncio.create_task(_reader())
+    try:
+        await _writer()
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        reader_task.cancel()
+
+
+def _ws_matches(event: dict, filters: dict) -> bool:
+    if not filters:
+        return True
+    host_f = filters.get("host", "").lower()
+    if host_f and host_f not in (event.get("host") or "").lower():
+        return False
+    sev_f = filters.get("severity", "").lower()
+    if sev_f and (event.get("severity") or "").lower() != sev_f:
+        return False
+    search_f = filters.get("search", "").lower()
+    if search_f and search_f not in (event.get("message") or "").lower():
+        return False
+    program_f = filters.get("program", "").lower()
+    if program_f and program_f not in (event.get("program") or "").lower():
+        return False
+    return True
+
+
 # ── Stats API ─────────────────────────────────────────────────────────────────
 
-@app.get("/api/stats")
-async def stats():
+# Cache stats for STATS_TTL seconds so repeated UI polls + chat context reuse
+# the same fetch. 500K-row events table scans are expensive; refreshing once
+# every 10s is plenty fresh for a dashboard.
+_STATS_CACHE: dict = {"ts": 0.0, "data": None}
+_STATS_TTL = float(os.environ.get("STATS_CACHE_TTL", "10"))
+_stats_lock = asyncio.Lock()
+
+
+async def _fetch_stats() -> dict:
+    """Bounded stats query: uses WHERE timestamp > NOW() - 24h so the planner
+    can use the timestamp index instead of scanning the entire events table."""
     async with _pool.acquire() as conn:
         counts = await conn.fetchrow("""
             SELECT
                 COUNT(*) FILTER (WHERE timestamp > NOW() - INTERVAL '1 hour') AS events_1h,
-                COUNT(*) FILTER (WHERE timestamp > NOW() - INTERVAL '24 hours') AS events_24h,
-                COUNT(*) FILTER (WHERE severity IN ('emerg','alert','crit','err','error')
-                                   AND timestamp > NOW() - INTERVAL '24 hours') AS errors_24h
+                COUNT(*)                                                       AS events_24h,
+                COUNT(*) FILTER (WHERE severity IN ('emerg','alert','crit','err','error')) AS errors_24h
             FROM events
+            WHERE timestamp > NOW() - INTERVAL '24 hours'
         """)
         alert_counts = await conn.fetchrow("""
             SELECT
@@ -285,13 +504,39 @@ async def stats():
                 COUNT(*) FILTER (WHERE timestamp > NOW() - INTERVAL '24 hours') AS today
             FROM alerts
         """)
-        return {
-            "events_1h": counts["events_1h"],
-            "events_24h": counts["events_24h"],
-            "errors_24h": counts["errors_24h"],
-            "alerts_unacked": alert_counts["unacked"],
-            "alerts_today": alert_counts["today"],
-        }
+    return {
+        "events_1h":     counts["events_1h"],
+        "events_24h":    counts["events_24h"],
+        "errors_24h":    counts["errors_24h"],
+        "alerts_unacked": alert_counts["unacked"],
+        "alerts_today":  alert_counts["today"],
+    }
+
+
+async def _cached_stats() -> dict:
+    now = asyncio.get_running_loop().time()
+    if _STATS_CACHE["data"] is not None and now - _STATS_CACHE["ts"] < _STATS_TTL:
+        return _STATS_CACHE["data"]
+    async with _stats_lock:
+        # Double-check under lock in case another caller populated while we waited.
+        now = asyncio.get_running_loop().time()
+        if _STATS_CACHE["data"] is not None and now - _STATS_CACHE["ts"] < _STATS_TTL:
+            return _STATS_CACHE["data"]
+        try:
+            data = await _fetch_stats()
+            _STATS_CACHE["data"] = data
+            _STATS_CACHE["ts"] = now
+            return data
+        except Exception as e:
+            # If the fresh fetch fails, serve stale data so the UI doesn't brick.
+            if _STATS_CACHE["data"] is not None:
+                return _STATS_CACHE["data"]
+            raise
+
+
+@app.get("/api/stats")
+async def stats():
+    return await _cached_stats()
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -419,7 +664,273 @@ async def alert_history(request: Request, page: int = 1):
 async def acknowledge_alert(alert_id: int):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE alerts SET acknowledged=TRUE WHERE id=$1", alert_id)
+    # Bust cached stats + chat context so UI counters update immediately.
+    _STATS_CACHE["data"] = None
     return JSONResponse({"ok": True})
+
+
+@app.get("/api/warnings")
+async def api_warnings():
+    """Dashboard active-warnings feed. Returned as JSON so the dashboard can
+    poll and re-render the warnings grid without a full page reload."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, severity, title, description, affected_hosts,
+                   seen_count, last_seen, recommended_action, timestamp
+            FROM alerts
+            WHERE NOT acknowledged
+              AND COALESCE(last_seen, timestamp) > NOW() - INTERVAL '24 hours'
+            ORDER BY
+              CASE severity
+                WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4
+              END,
+              COALESCE(last_seen, timestamp) DESC
+            LIMIT 20
+        """)
+    return JSONResponse(jsonable_encoder([dict(r) for r in rows]))
+
+
+class AlertIgnoreRequest(BaseModel):
+    host: str | None = None       # override; default = all affected_hosts
+    program: str | None = None    # optional program scope
+    pattern: str | None = None    # optional title/pattern text
+
+
+@app.post("/api/alerts/{alert_id}/ignore")
+async def api_alert_ignore(alert_id: int, req: AlertIgnoreRequest | None = None):
+    """Acknowledge the alert AND insert an event_feedback row per affected host
+    with verdict='ignore' so future matching events are silently dropped.
+    The processor fast-LLM signature cache is invalidated via the pubsub
+    channel so the rule takes effect immediately."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, title, description, affected_hosts, cooldown_key FROM alerts WHERE id=$1",
+            alert_id,
+        )
+        if not row:
+            raise HTTPException(404, "alert not found")
+
+        hosts: list[str] = []
+        if req and req.host:
+            hosts = [req.host]
+        else:
+            hosts = list(row["affected_hosts"] or [])
+        if not hosts:
+            hosts = [""]
+
+        pattern = (req.pattern if req else None) or (row["title"] or "")[:200]
+        program = (req.program if req else None) or ""
+
+        for h in hosts:
+            await conn.execute(
+                """INSERT INTO event_feedback (event_id, host, program, pattern, verdict)
+                   VALUES (NULL, $1, $2, $3, 'ignore')""",
+                h, program, pattern or "*",
+            )
+
+        await conn.execute(
+            "UPDATE alerts SET acknowledged=TRUE WHERE id=$1", alert_id,
+        )
+
+    cooldown_key = row.get("cooldown_key") or ""
+    if cooldown_key:
+        try:
+            await _redis.sadd("loglm:ignored_alert_keys", cooldown_key)
+        except Exception as e:
+            print(f"[web] ignored key store failed: {e}")
+
+    try:
+        await _redis.publish("loglm:feedback", json.dumps({
+            "verdict": "ignore", "alert_id": alert_id,
+            "hosts": hosts, "pattern": pattern[:120],
+        }))
+    except Exception as e:
+        print(f"[web] alert-ignore publish failed: {e}")
+
+    _STATS_CACHE["data"] = None
+    return JSONResponse({"ok": True, "hosts": hosts, "pattern": pattern})
+
+
+# ── Natural-language ignore / important rules ─────────────────────────────────
+
+_NL_RULE_SYSTEM = """You are a log monitoring rule parser for a home/SOHO network monitor.
+The user will describe, in plain English, what log events they want to IGNORE or mark as IMPORTANT.
+Your job is to convert their description into one or more structured rules.
+
+Respond ONLY with valid JSON in this exact schema:
+{
+  "rules": [
+    {
+      "verdict": "ignore" | "important",
+      "host": "<specific hostname or IP, or empty string for any host>",
+      "program": "<specific program/service name, or empty string for any>",
+      "pattern": "<substring that would appear in the raw log MESSAGE, or empty string for host-wide>",
+      "description": "<one-line human description of what this rule does>"
+    }
+  ],
+  "summary": "<one sentence confirming what rules were created>"
+}
+
+Pattern guidance:
+- The pattern is matched as a SUBSTRING against raw syslog message text.
+- For firewall blocks: use patterns like "UFW BLOCK" or "DROPPED" — NOT alert titles.
+- For service noise: use the program name in the program field and leave pattern empty.
+- For host-wide suppression: use the host field and leave pattern/program empty.
+- Never use alert titles (like "SSH Brute Force") as patterns — use actual log text.
+- Firewall outbound blocks from internal devices: pattern="UFW BLOCK", program="kernel"
+- For broad categories like "all firewall policy blocks from internal devices",
+  create separate rules for common patterns: UFW BLOCK, DROPPED, REJECT.
+
+Examples:
+User: "ignore firewall blocks from internal devices"
+→ rules: [{verdict:"ignore", host:"", program:"kernel", pattern:"UFW BLOCK", ...},
+           {verdict:"ignore", host:"", program:"kernel", pattern:"DROPPED", ...}]
+
+User: "ignore health check noise from nginx"
+→ rules: [{verdict:"ignore", host:"", program:"nginx", pattern:"GET /health", ...},
+           {verdict:"ignore", host:"", program:"nginx", pattern:"GET /ping", ...}]
+
+User: "flag authentication failures on server1 as important"
+→ rules: [{verdict:"important", host:"server1", program:"", pattern:"authentication failure", ...}]
+"""
+
+
+class NLRuleRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/rules/natural")
+async def api_natural_rule(req: NLRuleRequest):
+    """Parse a plain-English rule description into structured event_feedback rows
+    using the LLM, then insert them and notify the processor."""
+    if not req.text or len(req.text.strip()) < 5:
+        raise HTTPException(400, "rule description too short")
+
+    prompt = f'Create monitoring rules for: "{req.text.strip()}"'
+    payload = {
+        "model": os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M"),
+        "prompt": prompt,
+        "system": _NL_RULE_SYSTEM,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_predict": 400},
+    }
+    try:
+        resp = await _http.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        text = body.get("response", "").strip()
+    except Exception as e:
+        raise HTTPException(502, f"LLM unavailable: {e}")
+
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        parsed = json.loads(text[start:end]) if start >= 0 else {}
+    except Exception:
+        raise HTTPException(502, "LLM returned unparseable JSON")
+
+    rules = parsed.get("rules", [])
+    if not rules:
+        raise HTTPException(422, "LLM could not parse any rules from that description")
+
+    inserted = []
+    async with _pool.acquire() as conn:
+        for r in rules:
+            verdict = r.get("verdict", "ignore")
+            if verdict not in ("ignore", "important"):
+                continue
+            host = (r.get("host") or "")[:100]
+            program = (r.get("program") or "")[:100]
+            pattern = (r.get("pattern") or "")[:200]
+            desc = (r.get("description") or "")[:300]
+            if not host and not program and not pattern:
+                continue  # skip overly broad empty rule
+            row_id = await conn.fetchval(
+                """INSERT INTO event_feedback (event_id, host, program, pattern, verdict)
+                   VALUES (NULL, $1, $2, $3, $4) RETURNING id""",
+                host, program, pattern or "*", verdict,
+            )
+            inserted.append({"id": row_id, "verdict": verdict, "host": host,
+                              "program": program, "pattern": pattern, "description": desc})
+
+    if not inserted:
+        raise HTTPException(422, "No valid rules could be created from that description")
+
+    # Notify processor to reload feedback cache immediately.
+    try:
+        await _redis.publish("loglm:feedback", json.dumps({
+            "verdict": "natural_rule", "count": len(inserted),
+        }))
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "ok": True,
+        "inserted": len(inserted),
+        "rules": inserted,
+        "summary": parsed.get("summary", f"Created {len(inserted)} rule(s)."),
+    })
+
+
+@app.get("/api/rules")
+async def api_rules_list():
+    """Return all event_feedback rows for the rules management UI."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, host, program, pattern, verdict, created_at "
+            "FROM event_feedback ORDER BY created_at DESC LIMIT 200"
+        )
+    return JSONResponse(jsonable_encoder([dict(r) for r in rows]))
+
+
+@app.delete("/api/rules/{rule_id}")
+async def api_rule_delete(rule_id: int):
+    async with _pool.acquire() as conn:
+        r = await conn.execute("DELETE FROM event_feedback WHERE id=$1", rule_id)
+    if r == "DELETE 0":
+        raise HTTPException(404, "rule not found")
+    try:
+        await _redis.publish("loglm:feedback", json.dumps({"verdict": "rule_deleted", "id": rule_id}))
+    except Exception:
+        pass
+    return JSONResponse({"ok": True})
+
+
+# ── Topology knowledge API ────────────────────────────────────────────────────
+
+@app.get("/api/topology/learned")
+async def api_topology_learned():
+    """Return all learned device relationships (ARP, syslog correlation, firewall)."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT src_host, dst_host, relationship, evidence, confidence,
+                   event_count, first_seen, last_seen
+            FROM topology_learned
+            WHERE confidence >= 0.3
+            ORDER BY confidence DESC, event_count DESC
+            LIMIT 500
+        """)
+    return JSONResponse(jsonable_encoder([dict(r) for r in rows]))
+
+
+@app.get("/api/topology/ip-map")
+async def api_topology_ip_map(host: str = ""):
+    """Return IP↔hostname mappings, optionally filtered by host."""
+    async with _pool.acquire() as conn:
+        if host:
+            rows = await conn.fetch(
+                "SELECT ip, host, source, confidence, last_seen "
+                "FROM host_ip_map WHERE host = $1 ORDER BY confidence DESC",
+                host,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT ip, host, source, confidence, last_seen "
+                "FROM host_ip_map ORDER BY confidence DESC, last_seen DESC LIMIT 1000"
+            )
+    return JSONResponse(jsonable_encoder([dict(r) for r in rows]))
 
 
 # ── Aliases ───────────────────────────────────────────────────────────────────
@@ -1157,21 +1668,25 @@ def _safe_host(host: str) -> str:
     return host
 
 
+HOST_TYPES = ["auto", "router", "firewall", "switch", "ap", "server", "nas", "nginx", "container", "other"]
+
+
 class HostMetadataPayload(BaseModel):
     tags: list[str] | None = None
     notes: str | None = None
     pinned: bool | None = None
+    host_type: str | None = None
 
 
 async def _get_host_metadata(conn: asyncpg.Connection, host: str) -> dict:
     row = await conn.fetchrow(
-        "SELECT host, tags, notes, pinned, created_at, updated_at "
+        "SELECT host, host_type, tags, notes, pinned, created_at, updated_at "
         "FROM host_metadata WHERE host = $1",
         host,
     )
     if row:
         return dict(row)
-    return {"host": host, "tags": [], "notes": None, "pinned": False}
+    return {"host": host, "host_type": "auto", "tags": [], "notes": None, "pinned": False}
 
 
 @app.get("/api/hosts")
@@ -1261,10 +1776,25 @@ async def api_host_summary(host: str):
         snmp_latest = await conn.fetchrow("""
             SELECT timestamp, sys_name, avg_cpu, wifi_clients,
                    interfaces_up, interfaces_down, total_in_bps, total_out_bps,
-                   total_errors
+                   total_errors, raw_data
             FROM snmp_metrics WHERE host = $1
             ORDER BY timestamp DESC LIMIT 1
         """, host)
+
+    snmp_dict = None
+    if snmp_latest:
+        snmp_dict = dict(snmp_latest)
+        # Promote sfp_sensors + interface details out of raw_data for easy rendering
+        raw = snmp_dict.pop("raw_data", None)
+        if raw:
+            if isinstance(raw, str):
+                import json as _json
+                try:
+                    raw = _json.loads(raw)
+                except Exception:
+                    raw = {}
+            snmp_dict["sfp_sensors"] = raw.get("sfp_sensors", [])
+            snmp_dict["interfaces"]  = raw.get("interfaces", {})
 
     return JSONResponse(jsonable_encoder({
         "host": host,
@@ -1272,7 +1802,7 @@ async def api_host_summary(host: str):
         "metadata": meta,
         "device": dict(device) if device else None,
         "stats": dict(stats) if stats else {},
-        "snmp_latest": dict(snmp_latest) if snmp_latest else None,
+        "snmp_latest": snmp_dict,
         "events": [dict(r) for r in recent_events],
         "alerts": [dict(r) for r in active_alerts],
     }))
@@ -1287,11 +1817,13 @@ async def api_host_metadata_update(host: str, p: HostMetadataPayload):
         tags = sorted({t.strip().lower() for t in p.tags if t and t.strip()})
     async with _pool.acquire() as conn:
         existing = await conn.fetchrow("SELECT 1 FROM host_metadata WHERE host=$1", host)
+        host_type = p.host_type if p.host_type in HOST_TYPES else None
         if existing is None:
             await conn.execute(
-                """INSERT INTO host_metadata (host, tags, notes, pinned)
-                   VALUES ($1, $2, $3, $4)""",
+                """INSERT INTO host_metadata (host, host_type, tags, notes, pinned)
+                   VALUES ($1, $2, $3, $4, $5)""",
                 host,
+                host_type or "auto",
                 tags or [],
                 p.notes,
                 bool(p.pinned),
@@ -1300,6 +1832,8 @@ async def api_host_metadata_update(host: str, p: HostMetadataPayload):
             sets = []
             args: list = []
             n = 1
+            if host_type is not None:
+                sets.append(f"host_type = ${n}"); args.append(host_type); n += 1
             if tags is not None:
                 sets.append(f"tags = ${n}"); args.append(tags); n += 1
             if p.notes is not None:
@@ -1323,6 +1857,7 @@ async def host_page(request: Request, host: str):
     return templates.TemplateResponse("host.html", {
         "request": request,
         "host": host,
+        "host_types": HOST_TYPES,
     })
 
 
@@ -1362,7 +1897,10 @@ class TopologyEdgePayload(BaseModel):
 @app.get("/api/topology")
 async def api_topology():
     """Return the saved topology + auto-promote any known hosts that don't yet
-    have a node row. Auto-rows are virtual until the user moves them."""
+    have a node row. Auto-rows are virtual until the user moves them.
+
+    Dedupes by host across topology_nodes/snmp_devices/host_metadata so the
+    vis-network DataSet never sees a duplicate id (which would error the page)."""
     async with _pool.acquire() as conn:
         nodes = await conn.fetch(
             "SELECT host, label, icon, color, x, y, pinned, notes FROM topology_nodes"
@@ -1370,35 +1908,67 @@ async def api_topology():
         edges = await conn.fetch(
             "SELECT id, from_host, to_host, label, color, weight, auto FROM topology_edges"
         )
-        # Hosts we know about but that don't yet have a topology_node row.
-        known = await conn.fetch("""
-            SELECT d.host, d.device_type, COALESCE(d.label, d.host) AS label
-            FROM snmp_devices d
-            WHERE NOT EXISTS (SELECT 1 FROM topology_nodes n WHERE n.host = d.host)
-            UNION
-            SELECT host, NULL, host
-            FROM host_metadata
-            WHERE NOT EXISTS (SELECT 1 FROM topology_nodes n WHERE n.host = host_metadata.host)
-        """)
+        # Known hosts from other tables. Use separate fetches so we can dedupe
+        # in Python and not worry about UNION column-compat edge cases.
+        snmp_hosts = await conn.fetch(
+            "SELECT host, device_type, COALESCE(label, host) AS label FROM snmp_devices"
+        )
+        meta_hosts = await conn.fetch("SELECT host FROM host_metadata")
 
-    nodes_out = [dict(r) for r in nodes]
-    for r in known:
+    # 1) Start with the real topology_nodes rows, keyed by host.
+    by_host: dict[str, dict] = {}
+    for r in nodes:
         d = dict(r)
-        nodes_out.append({
-            "host":   d["host"],
-            "label":  d.get("label") or d["host"],
-            "icon":   _icon_for_device_type(d.get("device_type")),
+        if not d.get("host"):
+            continue
+        d["auto"] = False
+        by_host[d["host"]] = d
+
+    # 2) Auto-promote snmp_devices that don't yet have a topology_node row.
+    for r in snmp_hosts:
+        h = r["host"]
+        if not h or h in by_host:
+            continue
+        by_host[h] = {
+            "host":   h,
+            "label":  r["label"] or h,
+            "icon":   _icon_for_device_type(r.get("device_type")),
             "color":  None,
             "x":      None,
             "y":      None,
             "pinned": False,
             "notes":  None,
             "auto":   True,
-        })
+        }
+
+    # 3) Auto-promote host_metadata rows that neither of the above covers.
+    for r in meta_hosts:
+        h = r["host"]
+        if not h or h in by_host:
+            continue
+        by_host[h] = {
+            "host":   h,
+            "label":  h,
+            "icon":   "server",
+            "color":  None,
+            "x":      None,
+            "y":      None,
+            "pinned": False,
+            "notes":  None,
+            "auto":   True,
+        }
+
+    # 4) Filter edges so we never emit one whose endpoints don't exist as nodes
+    # (that would also break the vis-network DataSet).
+    edges_out = []
+    for r in edges:
+        d = dict(r)
+        if d.get("from_host") in by_host and d.get("to_host") in by_host:
+            edges_out.append(d)
 
     return JSONResponse(jsonable_encoder({
-        "nodes": nodes_out,
-        "edges": [dict(r) for r in edges],
+        "nodes": list(by_host.values()),
+        "edges": edges_out,
     }))
 
 
@@ -1722,22 +2292,41 @@ async def api_system_set_ntp(p: NtpPayload):
 #  CHAT WITH MEMORY
 # ═════════════════════════════════════════════════════════════════════════════
 
-CHAT_SYSTEM = """You are LogLM, an AI assistant for a home/small-office network monitoring system.
-You have access to memory summaries of recent network activity, current SNMP metrics,
-recent events, alerts, and the full conversation history.
+CHAT_SYSTEM_QUICK = """You are LogLM Quick, an AI assistant for a home/small-office network monitor.
+You have access to memory summaries, current SNMP metrics, recent notable events, and alerts.
 
-Your users are network administrators who will ask you questions like:
-- "What's changed in the last hour?"
-- "Anything look different?"
-- "What just happened?"
-- "Is the router doing OK?"
-- "How many wifi clients are connected?"
-- "Summarise today's alerts"
-- "Any suspicious activity?"
+Answer concisely in 2-6 sentences. Focus on current state and anything worth acting on.
+Reference actual hostnames, IPs, timestamps, and counts.
+If something is fine, say so — don't pad with caveats.
+Do not make up events or metrics."""
 
-Answer concisely and specifically. Reference actual hostnames, IPs, timestamps, and numbers.
-If you don't have enough data to answer, say so. Do not make up events or metrics.
-Format your response in plain text with line breaks for readability."""
+CHAT_SYSTEM_DEEP = """You are LogLM Investigator, a network forensics assistant.
+Your job is to trace what happened across all log sources, SNMP data, and device relationships.
+
+When the user asks about an event, incident, or time window:
+1. Build a TIMELINE — list events in chronological order across ALL hosts in the window.
+   Include info/notice events — they often fill in the story (reconnects, auth successes, etc.)
+2. Identify CAUSAL CHAINS — e.g. router rebooted → downstream devices lost link → DHCP renewals.
+   Use the topology data to know which devices are upstream/downstream of each other.
+3. LINK IPs to hosts — the context includes a host_ip_map. If a log mentions 10.x.x.x,
+   look it up and name the actual device. Show your reasoning: "10.20.10.5 = NAS (from ARP/syslog)".
+4. Use SNMP data to corroborate — interface counters dropping, CPU spike, link state changes.
+5. State your CONFIDENCE — if it's circumstantial, say so. If you can't link two events, say so.
+
+Format:
+TIMELINE (chronological)
+→ [HH:MM:SS] host: what happened
+
+CAUSAL CHAIN
+→ [event A] caused [event B] because [reason]
+
+CONCLUSION
+→ What happened, confidence level, recommended follow-up.
+
+Reference actual hostnames, IPs, timestamps. Do not invent data."""
+
+# Backwards-compat alias used in non-chat code paths (analyzer hints etc)
+CHAT_SYSTEM = CHAT_SYSTEM_QUICK
 
 
 _TIME_WINDOW_RE = re.compile(
@@ -1764,15 +2353,53 @@ def _extract_time_window(message: str) -> tuple[str, str] | None:
     return None
 
 
+_CHAT_CTX_CACHE: dict = {"ts": 0.0, "key": None, "data": None}
+_CHAT_CTX_TTL = float(os.environ.get("CHAT_CTX_TTL", "8"))
+_chat_ctx_lock = asyncio.Lock()
+
+
 async def build_chat_context(pool: asyncpg.Pool, redis_client: aioredis.Redis,
                               user_message: str = "") -> str:
     """Gather current state for the LLM's context window.
     If the user asked about a specific time window ('last hour', 'past 30 min'),
     the events section is narrowed to that window and a broader event sample
-    is returned so the LLM can RCA the window."""
+    is returned so the LLM can RCA the window.
+
+    Cached for CHAT_CTX_TTL seconds on a key that includes the extracted time
+    window — so rapid-fire questions about the same period reuse one fetch,
+    but a new "last 3 hours" question still forces a fresh read."""
+    time_window = _extract_time_window(user_message) if user_message else None
+    cache_key = ("window", time_window) if time_window else ("base",)
+    now_mono = asyncio.get_running_loop().time()
+    if (_CHAT_CTX_CACHE["data"] is not None
+            and _CHAT_CTX_CACHE["key"] == cache_key
+            and now_mono - _CHAT_CTX_CACHE["ts"] < _CHAT_CTX_TTL):
+        return _CHAT_CTX_CACHE["data"]
+
+    async with _chat_ctx_lock:
+        now_mono = asyncio.get_running_loop().time()
+        if (_CHAT_CTX_CACHE["data"] is not None
+                and _CHAT_CTX_CACHE["key"] == cache_key
+                and now_mono - _CHAT_CTX_CACHE["ts"] < _CHAT_CTX_TTL):
+            return _CHAT_CTX_CACHE["data"]
+        try:
+            result = await _build_chat_context_inner(pool, user_message, time_window)
+        except Exception as e:
+            # If the rebuild fails, fall back to stale cache so chat still works.
+            if _CHAT_CTX_CACHE["data"] is not None:
+                return _CHAT_CTX_CACHE["data"]
+            raise
+        _CHAT_CTX_CACHE["data"] = result
+        _CHAT_CTX_CACHE["ts"] = now_mono
+        _CHAT_CTX_CACHE["key"] = cache_key
+        return result
+
+
+async def _build_chat_context_inner(pool: asyncpg.Pool,
+                                     user_message: str,
+                                     time_window) -> str:
     sections = []
     now = datetime.now(timezone.utc)
-    time_window = _extract_time_window(user_message) if user_message else None
 
     async with pool.acquire() as conn:
         # Recent memory summaries (last 6 = ~30 min of coverage)
@@ -1800,8 +2427,6 @@ async def build_chat_context(pool: asyncpg.Pool, redis_client: aioredis.Redis,
                     f"{a['title']} — {a['description'][:100]} (hosts: {hosts})"
                 )
 
-        # Recent notable events — narrow to user-specified window if given,
-        # otherwise default to last hour.
         if time_window:
             start_iso, end_iso = time_window
             events = await conn.fetch(
@@ -1830,6 +2455,22 @@ async def build_chat_context(pool: asyncpg.Pool, redis_client: aioredis.Redis,
                 f"[{e['timestamp'].strftime('%H:%M:%S')}] {e['severity'].upper()} "
                 f"{e['host']} ({e['source']}): {e['message'][:150]}"
             )
+
+        if not time_window:
+            info_sample = await conn.fetch("""
+                SELECT timestamp, host, source, severity, message
+                FROM events
+                WHERE timestamp > NOW() - INTERVAL '1 hour'
+                  AND severity IN ('info', 'notice')
+                ORDER BY timestamp DESC LIMIT 15
+            """)
+            if info_sample:
+                sections.append("\n=== RECENT NORMAL ACTIVITY (sample, last 1h) ===")
+                for e in info_sample:
+                    sections.append(
+                        f"[{e['timestamp'].strftime('%H:%M:%S')}] {e['severity'].upper()} "
+                        f"{e['host']} ({e['source']}): {e['message'][:150]}"
+                    )
 
         # Concerning firewall flows (last 1h). Top-talker summary for RCA.
         try:
@@ -1892,21 +2533,40 @@ async def build_chat_context(pool: asyncpg.Pool, redis_client: aioredis.Redis,
         except Exception:
             pass
 
-        # Event statistics
         stats = await conn.fetchrow("""
             SELECT
                 COUNT(*) FILTER (WHERE timestamp > NOW() - INTERVAL '1 hour')  AS last_1h,
                 COUNT(*) FILTER (WHERE timestamp > NOW() - INTERVAL '24 hours') AS last_24h,
                 COUNT(*) FILTER (WHERE severity IN ('err','error','crit','emerg','alert')
                                    AND timestamp > NOW() - INTERVAL '1 hour')  AS errors_1h,
+                COUNT(*) FILTER (WHERE severity = 'warning'
+                                   AND timestamp > NOW() - INTERVAL '1 hour')  AS warnings_1h,
+                COUNT(*) FILTER (WHERE severity IN ('info','notice')
+                                   AND timestamp > NOW() - INTERVAL '1 hour')  AS info_1h,
                 COUNT(DISTINCT host) FILTER (WHERE timestamp > NOW() - INTERVAL '1 hour') AS hosts_1h
             FROM events
         """)
         sections.append(f"\n=== EVENT STATS ===")
         sections.append(
-            f"Last 1h: {stats['last_1h']} events ({stats['errors_1h']} errors) from {stats['hosts_1h']} hosts | "
+            f"Last 1h: {stats['last_1h']} events "
+            f"({stats['errors_1h']} errors, {stats['warnings_1h']} warnings, "
+            f"{stats['info_1h']} info/notice) from {stats['hosts_1h']} hosts | "
             f"Last 24h: {stats['last_24h']} events"
         )
+
+        host_activity = await conn.fetch("""
+            SELECT host, COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE severity IN ('err','error','crit','emerg','alert')) AS errors
+            FROM events
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
+            GROUP BY host
+            ORDER BY total DESC LIMIT 15
+        """)
+        if host_activity:
+            sections.append("\n=== PER-HOST ACTIVITY (last 1h) ===")
+            for h in host_activity:
+                err_part = f" ({h['errors']} errors)" if h['errors'] else ""
+                sections.append(f"  {h['host']}: {h['total']} events{err_part}")
 
         # SNMP metrics
         snmp_latest = await conn.fetch("""
@@ -1941,9 +2601,285 @@ async def build_chat_context(pool: asyncpg.Pool, redis_client: aioredis.Redis,
     return "\n".join(sections)
 
 
+# ── Deep (Investigator) context ────────────────────────────────────────────────
+
+_DEEP_CTX_CACHE: dict = {"ts": 0.0, "key": None, "data": None}
+_DEEP_CTX_TTL = 15.0   # slightly longer — queries are expensive
+_deep_ctx_lock = asyncio.Lock()
+
+
+async def build_deep_context(pool: asyncpg.Pool, message: str = "") -> str:
+    """Full-spectrum context for the Investigator agent.
+
+    Differences from quick context:
+    • All event severities (not just error/warning) — info events fill the story
+    • Up to 400 events — timeline needs volume
+    • Default window: last 30 minutes (not 1 hour of highlights)
+    • Timeline grouped by 1-minute buckets for chronological narrative
+    • Full topology section: LLDP neighbours + learned connections + host_ip_map
+    • Full SNMP raw data (interfaces, SFP readings)
+    • IP resolution: every IP in the context is annotated with its known hostname
+    """
+    time_window = _extract_time_window(message) if message else None
+    # "what just happened" / "what happened" → last 30 min
+    if not time_window and re.search(r"\bjust\b|\brecent\b|\bnow\b", message, re.I):
+        end   = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=30)
+        time_window = (start.isoformat(), end.isoformat())
+
+    cache_key = ("deep", time_window or "base")
+    now_mono = asyncio.get_running_loop().time()
+
+    if (_DEEP_CTX_CACHE["data"] is not None
+            and _DEEP_CTX_CACHE["key"] == cache_key
+            and now_mono - _DEEP_CTX_CACHE["ts"] < _DEEP_CTX_TTL):
+        return _DEEP_CTX_CACHE["data"]
+
+    async with _deep_ctx_lock:
+        now_mono = asyncio.get_running_loop().time()
+        if (_DEEP_CTX_CACHE["data"] is not None
+                and _DEEP_CTX_CACHE["key"] == cache_key
+                and now_mono - _DEEP_CTX_CACHE["ts"] < _DEEP_CTX_TTL):
+            return _DEEP_CTX_CACHE["data"]
+        result = await _build_deep_context_inner(pool, message, time_window)
+        _DEEP_CTX_CACHE["data"] = result
+        _DEEP_CTX_CACHE["ts"]   = now_mono
+        _DEEP_CTX_CACHE["key"]  = cache_key
+        return result
+
+
+async def _build_deep_context_inner(pool: asyncpg.Pool,
+                                     message: str,
+                                     time_window) -> str:
+    sections: list[str] = []
+    now = datetime.now(timezone.utc)
+
+    async with pool.acquire() as conn:
+        # ── 1. Build IP → hostname resolution map ─────────────────────────────
+        ip_rows = await conn.fetch("""
+            SELECT ip, host, source, confidence
+            FROM host_ip_map
+            ORDER BY confidence DESC, last_seen DESC
+        """)
+        # Best-confidence mapping: ip → (host, source, confidence)
+        ip_to_host: dict[str, tuple[str, str, float]] = {}
+        for r in ip_rows:
+            if r["ip"] not in ip_to_host or r["confidence"] > ip_to_host[r["ip"]][2]:
+                ip_to_host[r["ip"]] = (r["host"], r["source"], float(r["confidence"]))
+
+        def resolve_ip(ip: str) -> str:
+            """Return 'hostname (ip)' if known, else just ip."""
+            if not ip:
+                return ip
+            info = ip_to_host.get(ip)
+            if info:
+                return f"{info[0]} ({ip}, via {info[1]})"
+            return ip
+
+        # ── 2. Topology overview ───────────────────────────────────────────────
+        topo_rows = await conn.fetch("""
+            SELECT src_host, dst_host, relationship, evidence, confidence, event_count
+            FROM topology_learned
+            WHERE confidence >= 0.5
+            ORDER BY confidence DESC, event_count DESC
+            LIMIT 60
+        """)
+        lldp_rows = await conn.fetch("""
+            SELECT local_host, local_port, remote_host, remote_port, last_seen
+            FROM lldp_neighbours
+            ORDER BY last_seen DESC
+            LIMIT 40
+        """)
+        if lldp_rows:
+            sections.append("=== PHYSICAL TOPOLOGY (LLDP) ===")
+            for r in lldp_rows:
+                sections.append(
+                    f"  {r['local_host']} port {r['local_port']} ↔ "
+                    f"{r['remote_host']} port {r['remote_port']}"
+                )
+        if topo_rows:
+            sections.append("\n=== LEARNED TOPOLOGY (ARP / firewall / syslog correlation) ===")
+            for r in topo_rows:
+                conf = f"{r['confidence']:.0%}"
+                sections.append(
+                    f"  [{conf}] {r['src_host']} — {r['relationship']} → {r['dst_host']}"
+                    f"  ({r['evidence'] or ''}, seen {r['event_count']}x)"
+                )
+
+        # ── 3. IP→hostname reference table ────────────────────────────────────
+        if ip_to_host:
+            sections.append("\n=== IP ADDRESS DIRECTORY ===")
+            # Group by host for readability
+            host_ips: dict[str, list[str]] = {}
+            for ip, (host, src, conf) in ip_to_host.items():
+                host_ips.setdefault(host, []).append(f"{ip}[{src},{conf:.0%}]")
+            for host, ips in sorted(host_ips.items()):
+                sections.append(f"  {host}: {', '.join(ips)}")
+
+        # ── 4. Full event timeline ─────────────────────────────────────────────
+        if time_window:
+            start_iso, end_iso = time_window
+            events = await conn.fetch("""
+                SELECT timestamp, host, source, severity, program, message, structured
+                FROM events
+                WHERE timestamp BETWEEN $1::timestamptz AND $2::timestamptz
+                ORDER BY timestamp ASC
+                LIMIT 500
+            """, start_iso, end_iso)
+            sections.append(
+                f"\n=== FULL EVENT TIMELINE ({start_iso[:16]} → {end_iso[:16]} UTC, "
+                f"all severities, {len(events)} events) ==="
+            )
+        else:
+            events = await conn.fetch("""
+                SELECT timestamp, host, source, severity, program, message, structured
+                FROM events
+                WHERE timestamp > NOW() - INTERVAL '30 minutes'
+                ORDER BY timestamp ASC
+                LIMIT 400
+            """)
+            sections.append(
+                f"\n=== FULL EVENT TIMELINE (last 30 min, all severities, {len(events)} events) ==="
+            )
+
+        # Group into 1-minute buckets for readability
+        import collections
+        buckets: dict[str, list] = collections.defaultdict(list)
+        for e in events:
+            bucket = e["timestamp"].strftime("%H:%M")
+            buckets[bucket].append(e)
+
+        for bucket, evs in sorted(buckets.items()):
+            sections.append(f"\n  [{bucket}]")
+            for e in evs:
+                host = e["host"]
+                msg  = e["message"][:200]
+                # Resolve IPs that appear inline in the message
+                # (quick pass — replace known IPs with "hostname (ip)")
+                for ip, (hname, _, _conf) in ip_to_host.items():
+                    if ip in msg and hname != host:
+                        msg = msg.replace(ip, f"{hname}({ip})")
+                sections.append(
+                    f"    {e['severity'].upper():8} {host} [{e['program'] or e['source']}]: {msg}"
+                )
+
+        # ── 5. Active alerts ───────────────────────────────────────────────────
+        alerts = await conn.fetch("""
+            SELECT timestamp, severity, title, description, affected_hosts,
+                   seen_count, acknowledged
+            FROM alerts
+            WHERE timestamp > NOW() - INTERVAL '24 hours'
+            ORDER BY timestamp DESC LIMIT 15
+        """)
+        if alerts:
+            sections.append("\n=== ALERTS (24h) ===")
+            for a in alerts:
+                ack  = " [ACK]" if a["acknowledged"] else ""
+                hosts = ", ".join(a["affected_hosts"] or [])
+                cnt  = f" ×{a['seen_count']}" if (a["seen_count"] or 1) > 1 else ""
+                sections.append(
+                    f"  [{a['timestamp'].strftime('%H:%M')}] {a['severity'].upper()}{ack}{cnt}: "
+                    f"{a['title']} — {a['description'][:120]} (hosts: {hosts})"
+                )
+
+        # ── 6. SNMP full snapshot ──────────────────────────────────────────────
+        snmp_rows = await conn.fetch("""
+            SELECT DISTINCT ON (host) host, sys_name, avg_cpu, wifi_clients,
+                   interfaces_up, interfaces_down, total_in_bps, total_out_bps,
+                   total_errors, raw_data, timestamp
+            FROM snmp_metrics
+            ORDER BY host, timestamp DESC
+        """)
+        if snmp_rows:
+            sections.append("\n=== SNMP DEVICE STATE ===")
+            for m in snmp_rows:
+                parts = [f"{m['sys_name'] or m['host']} ({m['host']}):"]
+                if m["avg_cpu"] is not None:
+                    parts.append(f"CPU={m['avg_cpu']:.1f}%")
+                parts.append(f"if={m['interfaces_up']}↑/{m['interfaces_down']}↓")
+                if m["total_errors"] and m["total_errors"] > 0:
+                    parts.append(f"ERRORS={m['total_errors']:.1f}/s")
+                if m["wifi_clients"]:
+                    parts.append(f"wifi={m['wifi_clients']}")
+                age = int((now - m["timestamp"].replace(tzinfo=timezone.utc)).total_seconds())
+                parts.append(f"(polled {age}s ago)")
+                sections.append("  " + " ".join(parts))
+
+                # Show per-interface detail for down or erroring interfaces
+                raw = m["raw_data"]
+                if raw:
+                    try:
+                        raw_dict = raw if isinstance(raw, dict) else json.loads(raw)
+                        ifaces = raw_dict.get("interfaces", {})
+                        down_ifs = [v["name"] for v in ifaces.values()
+                                    if v.get("oper_status") == "down"
+                                    and v.get("name") not in ("lo", "Null0", "Loopback0")]
+                        if down_ifs:
+                            sections.append(f"    DOWN interfaces: {', '.join(down_ifs)}")
+                        sfp = raw_dict.get("sfp_sensors", [])
+                        if sfp:
+                            sfp_parts = []
+                            for s in sfp:
+                                if s.get("is_sfp"):
+                                    sfp_parts.append(f"{s['name']}={s['value']}{s['unit']}")
+                            if sfp_parts:
+                                sections.append(f"    SFP: {', '.join(sfp_parts)}")
+                    except Exception:
+                        pass
+
+        # ── 7. Anomaly detections ──────────────────────────────────────────────
+        try:
+            anomalies = await conn.fetch("""
+                SELECT timestamp, kind, host, program, title, baseline, observed, severity
+                FROM anomaly_detections
+                WHERE timestamp > NOW() - INTERVAL '24 hours' AND NOT acknowledged
+                ORDER BY timestamp DESC LIMIT 20
+            """)
+            if anomalies:
+                sections.append("\n=== LEARNED ANOMALIES (24h) ===")
+                for a in anomalies:
+                    extra = ""
+                    if a["baseline"] is not None and a["observed"] is not None:
+                        extra = f" (baseline={a['baseline']:.1f} vs observed={a['observed']:.1f})"
+                    sections.append(
+                        f"  [{a['timestamp'].strftime('%H:%M')}] {a['severity'].upper()} "
+                        f"{a['kind']} on {a['host']}: {a['title']}{extra}"
+                    )
+        except Exception:
+            pass
+
+        # ── 8. Firewall flow summary ───────────────────────────────────────────
+        try:
+            flows = await conn.fetch("""
+                SELECT host, src_ip::text AS src_ip, dst_ip::text AS dst_ip,
+                       dst_port, port_name, direction, action, blocked,
+                       COUNT(*) AS n
+                FROM firewall_flows
+                WHERE timestamp > NOW() - INTERVAL '30 minutes'
+                GROUP BY host, src_ip, dst_ip, dst_port, port_name, direction, action, blocked
+                ORDER BY n DESC LIMIT 30
+            """)
+            if flows:
+                sections.append("\n=== FIREWALL FLOWS (30 min) ===")
+                for f in flows:
+                    src_r = resolve_ip(f["src_ip"])
+                    dst_r = resolve_ip(f["dst_ip"])
+                    act = f["action"] + ("/BLOCK" if f["blocked"] else "")
+                    sections.append(
+                        f"  {f['n']}× {f['direction'] or '?'} {src_r} → {dst_r}"
+                        f":{f['dst_port'] or '?'}/{f['port_name'] or ''} [{act}] on {f['host']}"
+                    )
+        except Exception:
+            pass
+
+    sections.append(f"\n=== CURRENT TIME: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC ===")
+    return "\n".join(sections)
+
+
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
+    mode: str = "quick"     # "quick" | "deep"
 
 
 @app.get("/chat", response_class=HTMLResponse)
@@ -1956,7 +2892,7 @@ async def chat_page(request: Request, session_id: str = ""):
         )
         if session_id:
             messages = await conn.fetch(
-                "SELECT role, content, created_at FROM chat_messages "
+                "SELECT role, content, created_at, mode FROM chat_messages "
                 "WHERE session_id = $1 ORDER BY created_at",
                 uuid.UUID(session_id),
             )
@@ -1999,29 +2935,43 @@ async def chat_send(req: ChatRequest):
         )
         history = list(reversed(history))
 
-    # Build context (honours time-window phrases in the user's message)
-    context = await build_chat_context(_pool, _redis, req.message)
+    # Build context and select model/prompt based on mode
+    mode = (req.mode or "quick").lower()
+    if mode == "deep":
+        context = await build_deep_context(_pool, req.message)
+        system_prompt = CHAT_SYSTEM_DEEP
+        model = OLLAMA_MODEL_DEEP
+        num_predict = 2048
+        temperature = 0.2
+    else:
+        mode = "quick"
+        context = await build_chat_context(_pool, _redis, req.message)
+        system_prompt = CHAT_SYSTEM_QUICK
+        model = OLLAMA_MODEL
+        num_predict = 800
+        temperature = 0.3
 
     # Build prompt with conversation history
+    agent_name = "LogLM Investigator" if mode == "deep" else "LogLM"
     prompt_parts = [f"SYSTEM CONTEXT:\n{context}\n"]
     prompt_parts.append("CONVERSATION HISTORY:")
     for msg in history[:-1]:  # exclude current message
-        role = "User" if msg["role"] == "user" else "LogLM"
+        role = "You" if msg["role"] == "user" else agent_name
         prompt_parts.append(f"{role}: {msg['content']}")
     prompt_parts.append(f"\nUser: {req.message}")
-    prompt_parts.append("\nLogLM:")
+    prompt_parts.append(f"\n{agent_name}:")
 
     full_prompt = "\n".join(prompt_parts)
 
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model,
         "prompt": full_prompt,
-        "system": CHAT_SYSTEM,
+        "system": system_prompt,
         "stream": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 1024,
+            "temperature": temperature,
+            "num_predict": num_predict,
         },
     }
 
@@ -2057,18 +3007,120 @@ async def chat_send(req: ChatRequest):
     # Store assistant response
     async with _pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, context_summary) VALUES ($1, 'assistant', $2, $3)",
-            sid, answer, context[:500],  # store truncated context for debugging
+            "INSERT INTO chat_messages (session_id, role, content, context_summary, mode) "
+            "VALUES ($1, 'assistant', $2, $3, $4)",
+            sid, answer, context[:500], mode,
         )
         await conn.execute(
-            "UPDATE chat_sessions SET updated_at = NOW(), title = COALESCE(NULLIF(title, 'New conversation'), $2) WHERE id = $1",
+            "UPDATE chat_sessions SET updated_at = NOW(), "
+            "title = COALESCE(NULLIF(title, 'New conversation'), $2) WHERE id = $1",
             sid, req.message[:60],
         )
 
     return JSONResponse({
         "session_id": str(sid),
-        "response": answer,
+        "response":   answer,
+        "mode":       mode,
     })
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Streaming chat — returns SSE with tokens as they arrive from LLM."""
+    if not req.message.strip():
+        raise HTTPException(400, "Empty message")
+
+    async with _pool.acquire() as conn:
+        if req.session_id:
+            sid = uuid.UUID(req.session_id)
+        else:
+            sid = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO chat_sessions (id, title) VALUES ($1, $2)",
+                sid, req.message[:60],
+            )
+        await conn.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES ($1, 'user', $2)",
+            sid, req.message,
+        )
+        history = await conn.fetch(
+            "SELECT role, content FROM chat_messages WHERE session_id = $1 "
+            "ORDER BY created_at DESC LIMIT 20",
+            sid,
+        )
+        history = list(reversed(history))
+
+    stream_mode = (req.mode or "quick").lower()
+    if stream_mode == "deep":
+        context = await build_deep_context(_pool, req.message)
+        system_prompt = CHAT_SYSTEM_DEEP
+        stream_model  = OLLAMA_MODEL_DEEP
+        num_predict   = 2048
+        temperature   = 0.2
+    else:
+        stream_mode   = "quick"
+        context = await build_chat_context(_pool, _redis, req.message)
+        system_prompt = CHAT_SYSTEM_QUICK
+        stream_model  = OLLAMA_MODEL
+        num_predict   = 800
+        temperature   = 0.3
+
+    agent_name = "LogLM Investigator" if stream_mode == "deep" else "LogLM"
+    prompt_parts = [f"SYSTEM CONTEXT:\n{context}\n"]
+    prompt_parts.append("CONVERSATION HISTORY:")
+    for msg in history[:-1]:
+        role = "You" if msg["role"] == "user" else agent_name
+        prompt_parts.append(f"{role}: {msg['content']}")
+    prompt_parts.append(f"\nUser: {req.message}")
+    prompt_parts.append(f"\n{agent_name}:")
+
+    payload = {
+        "model": stream_model,
+        "prompt": "\n".join(prompt_parts),
+        "system": system_prompt,
+        "stream": True,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }
+
+    async def _token_stream():
+        full_answer = []
+        yield f"data: {json.dumps({'session_id': str(sid), 'type': 'start', 'mode': stream_mode})}\n\n"
+        try:
+            async with _ollama_sem:
+                async with _http.stream("POST", f"{OLLAMA_URL}/api/generate",
+                                         json=payload, timeout=300) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = chunk.get("response", "")
+                        if token:
+                            full_answer.append(token)
+                            yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+                        if chunk.get("done"):
+                            break
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+
+        answer = "".join(full_answer) or "No response from LLM."
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, context_summary, mode) "
+                "VALUES ($1, 'assistant', $2, $3, $4)",
+                sid, answer, context[:500], stream_mode,
+            )
+            await conn.execute(
+                "UPDATE chat_sessions SET updated_at = NOW(), "
+                "title = COALESCE(NULLIF(title, 'New conversation'), $2) WHERE id = $1",
+                sid, req.message[:60],
+            )
+        yield f"data: {json.dumps({'type': 'done', 'session_id': str(sid), 'mode': stream_mode})}\n\n"
+
+    return StreamingResponse(_token_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/chat/sessions")
@@ -2085,7 +3137,7 @@ async def new_chat_session():
 async def get_chat_messages(session_id: str):
     async with _pool.acquire() as conn:
         messages = await conn.fetch(
-            "SELECT role, content, created_at FROM chat_messages "
+            "SELECT role, content, created_at, mode FROM chat_messages "
             "WHERE session_id = $1 ORDER BY created_at",
             uuid.UUID(session_id),
         )
@@ -2095,3 +3147,105 @@ async def get_chat_messages(session_id: str):
             for m in messages
         ]
     })
+
+
+# ── Config export/import (config-as-code) ─────────────────────────────────────
+
+@app.get("/api/config/export")
+async def config_export():
+    """Export all user-configurable state as JSON for version control."""
+    async with _pool.acquire() as conn:
+        aliases = [dict(r) for r in await conn.fetch(
+            "SELECT raw_name, alias FROM service_aliases")]
+        feedback = [dict(r) for r in await conn.fetch(
+            "SELECT host, program, pattern, verdict FROM event_feedback ORDER BY created_at")]
+        retention = [dict(r) for r in await conn.fetch(
+            "SELECT name, table_name, filter_clause, retention_days, enabled FROM retention_policies")]
+        devices = [dict(r) for r in await conn.fetch(
+            "SELECT host, port, community, device_type, label, poll_interfaces, poll_cpu, "
+            "poll_wireless, enabled FROM snmp_devices")]
+        sigma = [dict(r) for r in await conn.fetch(
+            "SELECT rule_id, title, enabled, level, status FROM sigma_rules")]
+        topo_nodes = [dict(r) for r in await conn.fetch(
+            "SELECT host, label, icon, color, x, y, pinned, notes FROM topology_nodes")]
+        topo_edges = [dict(r) for r in await conn.fetch(
+            "SELECT from_host, to_host, label, color, weight FROM topology_edges WHERE NOT auto")]
+    config = {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "service_aliases": aliases,
+        "event_feedback": feedback,
+        "retention_policies": retention,
+        "snmp_devices": devices,
+        "sigma_rules_state": sigma,
+        "topology_nodes": topo_nodes,
+        "topology_edges": topo_edges,
+    }
+    return JSONResponse(config)
+
+
+class ConfigImport(BaseModel):
+    config: dict
+    merge: bool = True
+
+
+@app.post("/api/config/import")
+async def config_import(req: ConfigImport):
+    """Import configuration. merge=True upserts, merge=False replaces."""
+    cfg = req.config
+    counts = {}
+    async with _pool.acquire() as conn:
+        if "service_aliases" in cfg:
+            for a in cfg["service_aliases"]:
+                await conn.execute(
+                    "INSERT INTO service_aliases (raw_name, alias) VALUES ($1, $2) "
+                    "ON CONFLICT (raw_name) DO UPDATE SET alias = $2",
+                    a["raw_name"], a["alias"],
+                )
+            counts["service_aliases"] = len(cfg["service_aliases"])
+
+        if "event_feedback" in cfg:
+            for f in cfg["event_feedback"]:
+                await conn.execute(
+                    "INSERT INTO event_feedback (host, program, pattern, verdict) "
+                    "SELECT $1, $2, $3, $4 WHERE NOT EXISTS "
+                    "(SELECT 1 FROM event_feedback WHERE pattern = $3 AND host = $1)",
+                    f.get("host"), f.get("program"), f["pattern"], f["verdict"],
+                )
+            counts["event_feedback"] = len(cfg["event_feedback"])
+
+        if "retention_policies" in cfg:
+            for r in cfg["retention_policies"]:
+                await conn.execute(
+                    "INSERT INTO retention_policies (name, table_name, filter_clause, retention_days, enabled) "
+                    "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO UPDATE SET "
+                    "table_name = $2, filter_clause = $3, retention_days = $4, enabled = $5",
+                    r["name"], r["table_name"], r.get("filter_clause"),
+                    r["retention_days"], r.get("enabled", True),
+                )
+            counts["retention_policies"] = len(cfg["retention_policies"])
+
+        if "snmp_devices" in cfg:
+            for d in cfg["snmp_devices"]:
+                await conn.execute(
+                    "INSERT INTO snmp_devices (host, port, community, device_type, label, enabled) "
+                    "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (host) DO UPDATE SET "
+                    "port = $2, community = $3, device_type = $4, label = $5, enabled = $6",
+                    d["host"], d.get("port", 161), d.get("community", "public"),
+                    d.get("device_type", "auto"), d.get("label"),
+                    d.get("enabled", True),
+                )
+            counts["snmp_devices"] = len(cfg["snmp_devices"])
+
+        if "topology_nodes" in cfg:
+            for n in cfg["topology_nodes"]:
+                await conn.execute(
+                    "INSERT INTO topology_nodes (host, label, icon, color, x, y, pinned, notes) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (host) DO UPDATE SET "
+                    "label=$2, icon=$3, color=$4, x=$5, y=$6, pinned=$7, notes=$8",
+                    n["host"], n.get("label"), n.get("icon"), n.get("color"),
+                    n.get("x"), n.get("y"), n.get("pinned", False), n.get("notes"),
+                )
+            counts["topology_nodes"] = len(cfg["topology_nodes"])
+
+    return JSONResponse({"imported": counts})

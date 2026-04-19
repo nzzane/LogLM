@@ -15,6 +15,8 @@ from collections import OrderedDict
 
 import httpx
 
+import metrics as proc_metrics
+
 log = logging.getLogger(__name__)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
@@ -68,12 +70,15 @@ def _cache_put(sig: str, val: dict) -> None:
 CATEGORIZE_SYSTEM_BASE = (
     "You are a log triage classifier. Output ONLY one JSON object with two keys:\n"
     '  "verdict": "keep" | "store" | "drop"\n'
-    '  "category": "security" | "network" | "service" | "config" | "noise" | "other"\n'
+    '  "category": "security" | "network" | "service" | "firewall_policy" | "config" | "noise" | "other"\n'
     "Rules:\n"
-    "- Auth failures, firewall blocks, port scans, intrusions => keep + security\n"
+    "- FIREWALL blocking an INTERNAL/RFC1918 IP (10.x, 192.168.x, 172.16-31.x) => store + firewall_policy  (this is normal managed access control, NOT a security event)\n"
+    "- Auth failures, SSH brute force, IDS/IPS alerts, intrusions from EXTERNAL IPs => keep + security\n"
+    "- Port scan from EXTERNAL IP => keep + security\n"
     "- Service crashes, OOM, container died, segfaults => keep + service\n"
-    "- Interface down, link errors, packet loss => keep + network\n"
+    "- Interface down, link errors, packet loss, SNMP alerts => keep + network\n"
     "- Routine cron/dhcp/health-check/info noise => drop + noise\n"
+    "- nginx/web proxy 5xx errors => keep + service\n"
     "- Otherwise: store + other\n"
     "No prose. JSON only."
 )
@@ -151,11 +156,14 @@ async def categorize(event: dict) -> dict | None:
     if cached is not None:
         return cached
 
-    msg = (event.get("message", "") or "")[:240]
+    raw_msg = (event.get("message", "") or "")[:240]
+    for inj in ("SYSTEM:", "ASSISTANT:", "Human:", "Assistant:",
+                "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"):
+        raw_msg = raw_msg.replace(inj, f"_{inj[1:]}")
     host = event.get("host", "")
     sev = event.get("severity", "info")
     program = event.get("program", "") or ""
-    prompt = f"[{sev}] {host} {program}: {msg}"
+    prompt = f"[{sev}] {host} {program}: {raw_msg}"
 
     payload = {
         "model": OLLAMA_MODEL_FAST,
@@ -176,7 +184,9 @@ async def categorize(event: dict) -> dict | None:
                 timeout=FAST_TIMEOUT + 1.0,
             )
             r.raise_for_status()
-            text = r.json().get("response", "").strip()
+            body = r.json()
+            proc_metrics.fast_llm_calls.inc()
+            text = body.get("response", "").strip()
         except asyncio.TimeoutError:
             log.debug("fast categorize timeout; falling back to static rules")
             return None

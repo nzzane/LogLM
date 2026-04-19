@@ -1,0 +1,143 @@
+title: SSH Brute Force Attempt
+id: 5cc9d520-a2ff-4a39-b1b3-a4b4c1e5a0d1
+status: stable
+level: high
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    program:
+      - sshd
+    message|contains:
+      - "Failed password"
+      - "Invalid user"
+      - "authentication failure"
+  condition: selection
+tags:
+  - attack.credential_access
+  - attack.t1110
+
+---
+
+title: SSH Root Login Attempt
+id: 6aa1d520-b3ff-4b39-c2b4-b5b5d2f6b1e2
+status: stable
+level: high
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    program:
+      - sshd
+    message|contains:
+      - "Failed password for root"
+      - "Invalid user root"
+  condition: selection
+tags:
+  - attack.credential_access
+  - attack.t1078
+
+---
+
+title: Successful SSH Login from Unusual Context
+id: 7bb2e630-c4aa-5c4a-d3c5-c6c6e3a7c2f3
+status: test
+level: medium
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    program:
+      - sshd
+    message|contains:
+      - "Accepted publickey"
+      - "Accepted password"
+  condition: selection
+tags:
+  - attack.initial_access
+  - attack.t1078
+
+---
+
+title: Sudo Privilege Escalation
+id: 8cc3f741-d5bb-6d5b-e4d6-d7d7f4b8d3a4
+status: stable
+level: medium
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    program:
+      - sudo
+    message|contains:
+      - "COMMAND="
+  condition: selection
+tags:
+  - attack.privilege_escalation
+  - attack.t1548
+
+---
+
+title: User Account Created
+id: 9dd4a852-e6cc-7e6c-f5e7-e8e8a5c9e4b5
+status: stable
+level: medium
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    message|contains:
+      - "new user:"
+      - "useradd"
+      - "adduser"
+  condition: selection
+tags:
+  - attack.persistence
+  - attack.t1136
+
+---
+
+title: User Account Deleted
+id: aee5b963-f7dd-8f7d-a6f8-f9f9b6daf5c6
+status: stable
+level: medium
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    message|contains:
+      - "delete user"
+      - "userdel"
+  condition: selection
+tags:
+  - attack.impact
+  - attack.t1531
+
+---
+
+title: PAM Authentication Failure
+id: bff6ca74-a8ee-9a8e-b7a9-a0a0c7eba6d7
+status: stable
+level: medium
+logsource:
+  product: linux
+  service: auth
+detection:
+  selection:
+    message|contains:
+      - "pam_unix"
+      - "authentication failure"
+  filter:
+    message|contains:
+      - "session opened"
+      - "session closed"
+  condition: selection
+tags:
+  - attack.credential_access
+  - attack.t1110
