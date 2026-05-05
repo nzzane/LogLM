@@ -31,8 +31,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from app import auth, observability
-import opscenter as ops
-import hitl as hitl_mod
+from app import opscenter as ops
+from app import hitl as hitl_mod
 
 try:
     import docker as docker_sdk
