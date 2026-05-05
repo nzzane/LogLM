@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+# Build-time proxy (pip). ARG only — not present in the running container.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 WORKDIR /app
 
 # Install dependencies first (layer-cached until requirements.txt changes)
