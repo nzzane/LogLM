@@ -847,6 +847,67 @@ CREATE TABLE IF NOT EXISTS monitoring_silences (
 CREATE INDEX IF NOT EXISTS idx_silences_expires ON monitoring_silences (expires_at) WHERE revoked_at IS NULL;
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- Correlation Engine
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS correlated_incidents (
+    id                   BIGSERIAL PRIMARY KEY,
+    detected_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    title                TEXT NOT NULL,
+    pattern_matched      TEXT NOT NULL,    -- cascade_link_failure | resource_exhaustion | ...
+    confidence           REAL NOT NULL,    -- 0.0 – 1.0
+    root_cause           TEXT NOT NULL,
+    severity             TEXT NOT NULL DEFAULT 'medium',
+    affected_hosts       TEXT[] NOT NULL DEFAULT '{}',
+    evidence             JSONB NOT NULL DEFAULT '[]',
+    event_ids            JSONB NOT NULL DEFAULT '[]',
+    alert_ids            JSONB NOT NULL DEFAULT '[]',
+    recommended_actions  JSONB NOT NULL DEFAULT '[]',
+    first_event_at       TEXT,
+    last_event_at        TEXT,
+    acknowledged         BOOLEAN NOT NULL DEFAULT FALSE,
+    acknowledged_at      TIMESTAMPTZ,
+    acknowledged_by      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_corr_detected ON correlated_incidents (detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_corr_pattern  ON correlated_incidents (pattern_matched);
+CREATE INDEX IF NOT EXISTS idx_corr_sev      ON correlated_incidents (severity, detected_at DESC);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Intelligent logging: HOT/WARM/COLD tiering
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- Mark events whose batch generated an alert (retention_boost)
+ALTER TABLE events ADD COLUMN IF NOT EXISTS retention_boost BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_events_boost ON events (retention_boost) WHERE retention_boost;
+
+-- Link table: which events contributed to which alert batch
+CREATE TABLE IF NOT EXISTS alert_event_links (
+    id          BIGSERIAL PRIMARY KEY,
+    alert_id    BIGINT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+    event_id    BIGINT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ael_alert ON alert_event_links (alert_id);
+CREATE INDEX IF NOT EXISTS idx_ael_event ON alert_event_links (event_id);
+
+-- Cold archive: compressed JSONB blobs of aged-out events
+CREATE TABLE IF NOT EXISTS cold_events_archive (
+    id             BIGSERIAL PRIMARY KEY,
+    host           TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    archived_date  DATE NOT NULL,        -- the calendar date of the original events
+    archived_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_count    INT NOT NULL DEFAULT 0,
+    events_blob    JSONB NOT NULL DEFAULT '[]',
+    search_index   TEXT NOT NULL DEFAULT '',   -- concatenated messages for ILIKE
+    UNIQUE (host, source, archived_date)
+);
+CREATE INDEX IF NOT EXISTS idx_cold_host   ON cold_events_archive (host, archived_date DESC);
+CREATE INDEX IF NOT EXISTS idx_cold_date   ON cold_events_archive (archived_date DESC);
+CREATE INDEX IF NOT EXISTS idx_cold_search ON cold_events_archive USING GIN (to_tsvector('english', search_index));
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- Runtime-editable settings (Three-tier LLM configuration, Ollama URLs, etc.)
 -- Created here so all services can rely on this table existing at DB init,
 -- regardless of which service starts first.

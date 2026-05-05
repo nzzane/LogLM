@@ -33,6 +33,8 @@ from pydantic import BaseModel
 from app import auth, observability
 from app import opscenter as ops
 from app import hitl as hitl_mod
+from app import correlation as corr_engine
+from app import log_tiers
 
 try:
     import docker as docker_sdk
@@ -390,6 +392,54 @@ async def startup():
             );
             CREATE INDEX IF NOT EXISTS idx_activity_feed_ts ON activity_feed (timestamp DESC);
 
+            -- Correlation incidents
+            CREATE TABLE IF NOT EXISTS correlated_incidents (
+                id                   BIGSERIAL PRIMARY KEY,
+                detected_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                title                TEXT NOT NULL,
+                pattern_matched      TEXT NOT NULL,
+                confidence           REAL NOT NULL,
+                root_cause           TEXT NOT NULL DEFAULT '',
+                severity             TEXT NOT NULL DEFAULT 'medium',
+                affected_hosts       TEXT[] NOT NULL DEFAULT '{}',
+                evidence             JSONB NOT NULL DEFAULT '[]',
+                event_ids            JSONB NOT NULL DEFAULT '[]',
+                alert_ids            JSONB NOT NULL DEFAULT '[]',
+                recommended_actions  JSONB NOT NULL DEFAULT '[]',
+                first_event_at       TEXT,
+                last_event_at        TEXT,
+                acknowledged         BOOLEAN NOT NULL DEFAULT FALSE,
+                acknowledged_at      TIMESTAMPTZ,
+                acknowledged_by      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_corr_detected ON correlated_incidents (detected_at DESC);
+
+            -- Alert-event linkage (feedback loop)
+            CREATE TABLE IF NOT EXISTS alert_event_links (
+                id         BIGSERIAL PRIMARY KEY,
+                alert_id   BIGINT NOT NULL,
+                event_id   BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ael_alert ON alert_event_links (alert_id);
+
+            -- Cold events archive
+            CREATE TABLE IF NOT EXISTS cold_events_archive (
+                id             BIGSERIAL PRIMARY KEY,
+                host           TEXT NOT NULL,
+                source         TEXT NOT NULL,
+                archived_date  DATE NOT NULL,
+                archived_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                event_count    INT NOT NULL DEFAULT 0,
+                events_blob    JSONB NOT NULL DEFAULT '[]',
+                search_index   TEXT NOT NULL DEFAULT '',
+                UNIQUE (host, source, archived_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cold_host ON cold_events_archive (host, archived_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_cold_date ON cold_events_archive (archived_date DESC);
+
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS retention_boost BOOLEAN NOT NULL DEFAULT FALSE;
+
             -- Monitoring silences
             CREATE TABLE IF NOT EXISTS monitoring_silences (
                 id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -502,6 +552,18 @@ async def _hitl_expiry_loop():
 @app.on_event("startup")
 async def _start_background_tasks():
     asyncio.create_task(_hitl_expiry_loop())
+    asyncio.create_task(_correlation_scan_loop_wrapper())
+    asyncio.create_task(_log_archive_loop_wrapper())
+
+
+async def _correlation_scan_loop_wrapper():
+    if _pool:
+        await corr_engine.correlation_scan_loop(_pool, _redis)
+
+
+async def _log_archive_loop_wrapper():
+    if _pool:
+        await log_tiers.archive_loop(_pool)
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -4370,3 +4432,312 @@ async def api_audit_verify(request: Request):
 async def api_hitl_chat_system():
     """Return the HITL system prompt addendum injected into every chat call."""
     return JSONResponse({"system": hitl_mod.HITL_DETECTION_SYSTEM})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CORRELATION ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/correlation/incidents")
+async def api_correlation_incidents(
+    limit:  int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+    acknowledged: int = Query(default=0, ge=0, le=1),
+):
+    """Return persisted correlated incidents, most recent first."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, detected_at, title, pattern_matched, confidence,
+                      root_cause, severity, affected_hosts, evidence,
+                      recommended_actions, acknowledged, acknowledged_by,
+                      first_event_at, last_event_at
+               FROM correlated_incidents
+               WHERE acknowledged = $1
+               ORDER BY detected_at DESC
+               LIMIT $2 OFFSET $3""",
+            bool(acknowledged), limit, offset,
+        )
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM correlated_incidents WHERE acknowledged = $1",
+            bool(acknowledged),
+        )
+    return JSONResponse({
+        "total":     total,
+        "incidents": jsonable_encoder([dict(r) for r in rows]),
+    })
+
+
+@app.post("/api/correlation/run")
+async def api_correlation_run(
+    request: Request,
+    window_seconds: int = Query(default=corr_engine.CORRELATION_WINDOW_S, le=3600),
+    host: str | None = Query(default=None),
+):
+    """Run correlation on demand and return results without persisting."""
+    incidents = await corr_engine.correlate(_pool, window_seconds=window_seconds,
+                                             host_filter=host)
+    return JSONResponse([
+        {**_dc.asdict(inc)} for inc in incidents
+    ])
+
+
+@app.post("/api/correlation/incidents/{incident_id}/acknowledge")
+async def api_correlation_ack(incident_id: int, request: Request):
+    principal = request.state.user
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE correlated_incidents
+               SET acknowledged=TRUE, acknowledged_at=NOW(), acknowledged_by=$1
+               WHERE id=$2""",
+            principal.username, incident_id,
+        )
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/correlation/stream")
+async def api_correlation_stream(request: Request):
+    """SSE stream: pushes new correlated incidents as they are detected."""
+    async def _gen():
+        pubsub = _redis.pubsub()
+        await pubsub.subscribe("loglm:correlation")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    yield f"data: {msg['data']}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+        finally:
+            await pubsub.unsubscribe("loglm:correlation")
+            await pubsub.aclose()
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LOG TIERING — Cold storage search + stats
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/logs/tiers/stats")
+async def api_log_tiers_stats():
+    """Return event counts per storage tier."""
+    return JSONResponse(await log_tiers.get_tier_stats(_pool))
+
+
+@app.get("/api/logs/cold")
+async def api_logs_cold(
+    q:      str | None = Query(default=None, description="Full-text search"),
+    host:   str | None = Query(default=None),
+    start:  str | None = Query(default=None, description="ISO date YYYY-MM-DD"),
+    end:    str | None = Query(default=None, description="ISO date YYYY-MM-DD"),
+    limit:  int = Query(default=200, le=1000),
+):
+    """Search events in cold (archived) storage."""
+    from datetime import date as _date
+    start_dt = (datetime.fromisoformat(start) if start else None)
+    end_dt   = (datetime.fromisoformat(end)   if end   else None)
+    results = await log_tiers.search_cold(_pool, query=q, host=host,
+                                           start=start_dt, end=end_dt,
+                                           limit=limit)
+    return JSONResponse({"count": len(results), "events": results})
+
+
+@app.post("/api/logs/cold/archive-now")
+async def api_logs_archive_now(request: Request):
+    """Trigger an immediate cold archival pass (admin only)."""
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    stats = await log_tiers.archive_cold_batch(_pool)
+    return JSONResponse({"ok": True, "stats": stats})
+
+
+@app.post("/api/logs/boost/{event_id}")
+async def api_logs_boost(event_id: int, request: Request):
+    """Manually mark an event for extended HOT retention."""
+    if request.state.user.role not in (ops.ROLE_ADMIN, ops.ROLE_OPERATOR):
+        raise HTTPException(403, "operator or admin role required")
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE events SET retention_boost=TRUE WHERE id=$1", event_id
+        )
+    return JSONResponse({"ok": True, "event_id": event_id})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TOPOLOGY — SNMP Auto-Discovery + SSE + Health Overlay
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/topology/health-overlay")
+async def api_topology_health_overlay():
+    """
+    Return per-host alert status for the topology health overlay.
+    Used by topology.html to colour-code nodes by their current alert state.
+    """
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT UNNEST(affected_hosts) AS host,
+                      MAX(CASE severity
+                           WHEN 'critical' THEN 4
+                           WHEN 'high'     THEN 3
+                           WHEN 'medium'   THEN 2
+                           WHEN 'low'      THEN 1
+                           ELSE 0 END) AS max_sev,
+                      COUNT(*) AS alert_count
+               FROM alerts
+               WHERE NOT acknowledged
+                 AND (user_verdict IS NULL OR user_verdict != 'ignored')
+                 AND last_seen > NOW() - INTERVAL '1 hour'
+               GROUP BY host"""
+        )
+        sev_map = {0: "none", 1: "low", 2: "medium", 3: "high", 4: "critical"}
+        host_status = {
+            r["host"]: {
+                "severity": sev_map.get(r["max_sev"], "none"),
+                "count":    r["alert_count"],
+            }
+            for r in rows
+        }
+    return JSONResponse(host_status)
+
+
+@app.get("/api/topology/stream")
+async def api_topology_stream(request: Request):
+    """
+    SSE stream for real-time topology change notifications.
+    Emits {event: 'node_added'|'edge_added'|'node_removed', ...} JSON payloads.
+    Published to Redis by the processor's topology_learner_loop.
+    """
+    async def _gen():
+        pubsub = _redis.pubsub()
+        await pubsub.subscribe("loglm:topology_changed")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    yield f"data: {msg['data']}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(1.0)
+        finally:
+            await pubsub.unsubscribe("loglm:topology_changed")
+            await pubsub.aclose()
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@app.post("/api/topology/discover")
+async def api_topology_discover(request: Request):
+    """
+    Trigger SNMP-based auto-discovery. Queries all enabled SNMP devices
+    for their LLDP/CDP neighbour tables and inserts discovered neighbours
+    as topology nodes and edges.  Runs asynchronously; returns immediately.
+    """
+    if request.state.user.role not in (ops.ROLE_ADMIN, ops.ROLE_OPERATOR):
+        raise HTTPException(403, "operator or admin role required")
+    asyncio.create_task(_run_topology_discovery())
+    return JSONResponse({"ok": True, "message": "Discovery started — results appear in topology map within 30s"})
+
+
+async def _run_topology_discovery():
+    """
+    Walk SNMP devices in snmp_devices table, query their LLDP-MIB::lldpRemSysName
+    (OID 1.0.8802.1.1.2.1.4.1.1.9) to find direct neighbours, then upsert
+    into topology_nodes and topology_edges.
+    """
+    try:
+        async with _pool.acquire() as conn:
+            devices = await conn.fetch(
+                "SELECT host, community FROM snmp_devices WHERE enabled=TRUE LIMIT 50"
+            )
+    except Exception as e:
+        print(f"[topology_discover] DB error: {e}")
+        return
+
+    discovered = 0
+    for device in devices:
+        host      = device["host"]
+        community = device["community"] or "public"
+        try:
+            neighbours = await _snmp_get_lldp_neighbours(host, community)
+            for nbr in neighbours:
+                await _upsert_topo_node(nbr)
+                await _upsert_topo_edge(host, nbr)
+                discovered += 1
+        except Exception as e:
+            print(f"[topology_discover] SNMP walk {host}: {e}")
+
+    if discovered:
+        try:
+            await _redis.publish("loglm:topology_changed",
+                                  json.dumps({"event": "discovery_complete", "count": discovered}))
+        except Exception:
+            pass
+    print(f"[topology_discover] complete: {discovered} neighbours discovered")
+
+
+async def _snmp_get_lldp_neighbours(host: str, community: str) -> list[str]:
+    """
+    Walk lldpRemSysName OID to get names of directly-connected neighbours.
+    Returns a list of neighbour hostnames/IPs.
+    Falls back gracefully if the device doesn't support LLDP MIB.
+    """
+    try:
+        from pysnmp.hlapi.asyncio import (
+            getCmd, nextCmd, SnmpEngine, CommunityData, UdpTransportTarget,
+            ContextData, ObjectType, ObjectIdentity,
+        )
+        LLDP_REM_SYSNAME = "1.0.8802.1.1.2.1.4.1.1.9"
+        engine   = SnmpEngine()
+        target   = UdpTransportTarget((host, 161), timeout=3, retries=1)
+        community_data = CommunityData(community, mpModel=1)
+        neighbours: list[str] = []
+        async for (errInd, errStatus, errIdx, varBinds) in nextCmd(
+            engine, community_data, target, ContextData(),
+            ObjectType(ObjectIdentity(LLDP_REM_SYSNAME)),
+            lexicographicMode=False,
+        ):
+            if errInd or errStatus:
+                break
+            for varBind in varBinds:
+                oid_str = str(varBind[0])
+                if LLDP_REM_SYSNAME not in oid_str:
+                    break
+                nbr_name = str(varBind[1]).strip()
+                if nbr_name:
+                    neighbours.append(nbr_name)
+        return neighbours[:20]
+    except Exception:
+        return []
+
+
+async def _upsert_topo_node(host: str) -> None:
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO topology_nodes (host, label, icon, created_at, updated_at)
+                   VALUES ($1, $1, 'device', NOW(), NOW())
+                   ON CONFLICT (host) DO UPDATE SET updated_at = NOW()""",
+                host,
+            )
+    except Exception:
+        pass
+
+
+async def _upsert_topo_edge(from_host: str, to_host: str) -> None:
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO topology_edges (from_host, to_host, auto, weight)
+                   VALUES ($1, $2, TRUE, 1.0)
+                   ON CONFLICT (from_host, to_host) DO NOTHING""",
+                from_host, to_host,
+            )
+            await conn.execute(
+                """INSERT INTO topology_learned (src_host, dst_host, relationship,
+                       evidence, confidence, first_seen, last_seen)
+                   VALUES ($1, $2, 'lldp_neighbour', 'SNMP LLDP walk', 0.95, NOW(), NOW())
+                   ON CONFLICT (src_host, dst_host, relationship)
+                   DO UPDATE SET last_seen=NOW(), confidence=0.95""",
+                from_host, to_host,
+            )
+    except Exception:
+        pass

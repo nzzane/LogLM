@@ -11,3 +11,5 @@ passlib[bcrypt]==1.7.4
 itsdangerous==2.2.0
 prometheus-client==0.21.0
 maxminddb==2.6.2
+# pysnmp async helpers (used by LLDP topology discovery)
+pysnmplib>=6.2.0

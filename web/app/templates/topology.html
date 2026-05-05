@@ -2,317 +2,580 @@
 {% block title %}Topology · LogLM{% endblock %}
 
 {% block content %}
-<h1>Topology</h1>
-<p class="text-muted">Drag nodes to arrange. Click a node to open its host page. Right-click a node to edit. Click two nodes to connect them.</p>
-
-<div class="topo-toolbar">
-  <button id="btn-add-node">Add node</button>
-  <button id="btn-link-mode" class="ghost">Link mode: off</button>
-  <button id="btn-physics" class="ghost">Physics: off</button>
-  <button id="btn-fit">Fit view</button>
-  <button id="btn-reload" class="ghost">Reload</button>
-  <span class="text-muted small" id="topo-status"></span>
+<div class="topo-page-header">
+  <div>
+    <h1 style="margin:0;">Network Topology</h1>
+    <p class="text-muted" style="font-size:.8rem;margin-top:.2rem;">
+      Auto-discovered and manual. Drag nodes to arrange. Double-click to open host page.
+    </p>
+  </div>
+  <div class="topo-toolbar">
+    <button id="btn-add-node" class="btn ghost">+ Node</button>
+    <button id="btn-link-mode" class="btn ghost">⛓ Link mode: <span id="link-state">off</span></button>
+    <button id="btn-physics"  class="btn ghost">⚛ Physics: <span id="phys-state">off</span></button>
+    <button id="btn-health"   class="btn ghost" title="Overlay active-alert severity on nodes">🩺 Health overlay: <span id="health-state">off</span></button>
+    <button id="btn-discover" class="btn ghost" title="Query SNMP devices for LLDP neighbours">🔍 Auto-discover</button>
+    <button id="btn-fit"      class="btn ghost">⊡ Fit</button>
+    <button id="btn-reload"   class="btn ghost">↻ Reload</button>
+    <span class="text-muted" style="font-size:.75rem;" id="topo-status"></span>
+    <span id="live-topo-dot" style="font-size:.7rem;color:var(--text-muted);">○ disconnected</span>
+  </div>
 </div>
 
-<div id="topo-canvas" class="topo-canvas"></div>
+<!-- Legend + search -->
+<div style="display:flex;gap:.75rem;align-items:center;margin-bottom:.5rem;flex-wrap:wrap;">
+  <div class="topo-legend">
+    <span class="legend-dot" style="background:#3dd68c"></span>ok
+    <span class="legend-dot" style="background:#f5a623"></span>warning
+    <span class="legend-dot" style="background:#f04f59"></span>critical
+    <span class="legend-dot" style="background:#555;border:1px solid #888"></span>no alerts
+    <span class="legend-dash"></span>auto-discovered
+    <span class="legend-solid"></span>manual
+  </div>
+  <input type="text" id="topo-search" placeholder="search nodes…"
+         style="font-size:.8rem;padding:.3rem .5rem;background:var(--bg2);border:1px solid var(--border);
+                border-radius:4px;color:var(--text);width:180px;">
+  <select id="type-filter" style="font-size:.8rem;background:var(--bg2);border:1px solid var(--border);
+          border-radius:4px;color:var(--text);padding:.3rem .4rem;">
+    <option value="">all types</option>
+    <option value="router">router</option>
+    <option value="switch">switch</option>
+    <option value="ap">access point</option>
+    <option value="firewall">firewall</option>
+    <option value="server">server</option>
+    <option value="device">device</option>
+  </select>
+</div>
 
-<div class="card" style="margin-top:1rem;">
-  <div class="section-header"><h2>Selection</h2></div>
-  <div id="selection-panel" class="text-muted">click a node or edge</div>
+<!-- Main canvas + side panel -->
+<div class="topo-split">
+  <div id="topo-canvas" class="topo-canvas"></div>
+
+  <div class="topo-side-panel" id="side-panel">
+    <div id="sel-content" class="text-muted" style="font-size:.82rem;">
+      Click a node or edge to inspect it.
+    </div>
+  </div>
+</div>
+
+<!-- Correlation feed -->
+<div class="card" style="margin-top:.75rem;">
+  <div class="section-header">
+    <h2>Correlated Incidents <span id="corr-live" style="font-size:.65rem;color:var(--ok);">● LIVE</span></h2>
+    <a href="javascript:loadCorrelation()" class="btn ghost" style="font-size:.73rem;">Refresh</a>
+  </div>
+  <div id="corr-mount" class="text-muted" style="font-size:.82rem;">Loading…</div>
 </div>
 
 <link rel="stylesheet" href="/static/css/vis-network.min.css">
 <script src="/static/js/vis-network.min.js"></script>
+
+<style>
+.topo-page-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: .5rem; margin-bottom: .75rem;
+}
+.topo-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: .4rem;
+}
+.topo-split {
+  display: grid; grid-template-columns: 1fr 280px; gap: .75rem; align-items: start;
+}
+.topo-canvas {
+  height: 560px; background: var(--bg2);
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+.topo-side-panel {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; padding: .85rem; min-height: 200px; max-height: 560px;
+  overflow-y: auto;
+}
+.topo-legend {
+  display: flex; align-items: center; gap: .4rem;
+  font-size: .72rem; color: var(--text-muted);
+}
+.legend-dot   { display:inline-block;width:10px;height:10px;border-radius:50%; }
+.legend-dash  { display:inline-block;width:20px;height:2px;background:#888;border:none;
+                border-top:2px dashed #888;margin:0 .2rem; }
+.legend-solid { display:inline-block;width:20px;height:2px;background:#aaa;margin:0 .2rem; }
+
+/* node selection panel */
+.node-panel h3     { font-size:.9rem;margin-bottom:.6rem; }
+.node-panel .field { display:flex;flex-direction:column;gap:.2rem;font-size:.78rem;
+                     color:var(--text-muted);margin-bottom:.4rem; }
+.node-panel input, .node-panel select {
+  background:var(--bg); border:1px solid var(--border); border-radius:4px;
+  color:var(--text); padding:.3rem .4rem; font-size:.8rem;
+}
+.node-panel .alert-badge {
+  display:inline-block;padding:2px 6px;border-radius:3px;font-size:.68rem;
+  font-weight:600;
+}
+.node-panel .sev-critical { background:rgba(240,79,89,.15);color:var(--err); }
+.node-panel .sev-high     { background:rgba(255,140,0,.15); color:#ff8c00; }
+.node-panel .sev-medium   { background:rgba(245,166,35,.15);color:var(--warn); }
+.node-panel .sev-low      { background:rgba(91,192,222,.1); color:var(--info); }
+.node-panel .sev-none     { background:rgba(61,214,140,.1); color:var(--ok); }
+
+/* correlated incidents */
+.corr-card {
+  background:var(--bg); border:1px solid var(--border); border-radius:6px;
+  padding:.6rem .85rem; margin-bottom:.5rem; border-left:4px solid transparent;
+}
+.corr-card.sev-critical { border-left-color:var(--err); }
+.corr-card.sev-high     { border-left-color:#ff8c00; }
+.corr-card.sev-medium   { border-left-color:var(--warn); }
+.corr-card.sev-low      { border-left-color:var(--info); }
+.corr-title  { font-weight:600;font-size:.88rem; }
+.corr-meta   { font-size:.73rem;color:var(--text-muted);margin:.2rem 0; }
+.corr-root   { font-size:.8rem;margin:.3rem 0; }
+</style>
+
 <script>
 (function() {
   const ICONS = {{ icons | tojson }};
-  const ICON_GLYPH = {
-    server:   '\u25A0',  // ■
-    router:   '\u25C6',  // ◆
-    switch:   '\u25BC',  // ▼
-    ap:       '\u25B2',  // ▲
-    firewall: '\u2716',  // ✖
-    cloud:    '\u2601',  // ☁
-    device:   '\u25CF',  // ●
-  };
-  const COLORS = {
-    server:   '#8b9dc3',
-    router:   '#7bbcd6',
-    switch:   '#9ec19e',
-    ap:       '#d4b16a',
-    firewall: '#d68a8a',
-    cloud:    '#b5b5b5',
-    device:   '#aaaaaa',
-  };
+  const ICON_GLYPH = { server:'■', router:'◆', switch:'▼', ap:'▲',
+                        firewall:'✖', cloud:'☁', device:'●' };
+  const BASE_COLORS = { server:'#8b9dc3', router:'#7bbcd6', switch:'#9ec19e',
+                         ap:'#d4b16a', firewall:'#d68a8a', cloud:'#b5b5b5', device:'#aaa' };
+  const HEALTH_COLORS = { critical:'#f04f59', high:'#ff8c00', medium:'#f5a623',
+                            low:'#5bc0de', none:'#3dd68c' };
 
-  const canvas = document.getElementById('topo-canvas');
-  const status = document.getElementById('topo-status');
-  const selPanel = document.getElementById('selection-panel');
-  const btnLink = document.getElementById('btn-link-mode');
-  const btnPhys = document.getElementById('btn-physics');
-  const btnAdd = document.getElementById('btn-add-node');
-  const btnFit = document.getElementById('btn-fit');
-  const btnReload = document.getElementById('btn-reload');
-
+  const canvas  = document.getElementById('topo-canvas');
+  const statusEl = document.getElementById('topo-status');
+  const liveEl  = document.getElementById('live-topo-dot');
   let nodesDS = new vis.DataSet([]);
   let edgesDS = new vis.DataSet([]);
   let network = null;
-  let linkMode = false;
-  let physicsOn = false;
-  let pendingFromHost = null;  // first node clicked in link mode
-  let dragSaveTimer = null;
+  let linkMode = false, physicsOn = false, healthOn = false;
+  let pendingFrom = null;
+  let hostHealth = {};      // {host: {severity, count}}
+  let allNodes = [];        // full node set for filtering
+  let dragTimer = null;
+  let currentTypeFilter = '';
+  let currentSearch = '';
 
-  function escapeHtml(s) {
-    if (s == null) return '';
-    return String(s).replace(/[&<>"']/g, c => ({
-      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-    }[c]));
-  }
-
-  function nodeForServer(n) {
+  // ── Node builders ─────────────────────────────────────────────────────────
+  function nodeColor(n) {
     const icon = (n.icon || 'server').toLowerCase();
-    const glyph = ICON_GLYPH[icon] || ICON_GLYPH.server;
+    const base = n.color || BASE_COLORS[icon] || BASE_COLORS.server;
+    if (!healthOn) return { background: base, border: '#333', highlight: {background: base, border: '#aaa'} };
+    const h = hostHealth[n.host];
+    const sev = h ? h.severity : 'none';
+    const hc = HEALTH_COLORS[sev] || base;
+    return { background: base, border: hc,
+             highlight: { background: base, border: '#fff' } };
+  }
+
+  function buildVisNode(n) {
+    const icon = (n.icon || 'server').toLowerCase();
+    const glyph = ICON_GLYPH[icon] || '■';
+    const h = hostHealth[n.host];
+    const badge = h && h.count ? ` [${h.count}⚠]` : '';
     return {
-      id: n.host,
-      label: `${glyph} ${n.label || n.host}`,
-      title: `${n.host}${n.notes ? ' \u2014 ' + n.notes : ''}`,
-      color: { background: n.color || COLORS[icon] || COLORS.server, border: '#333' },
-      font: { color: '#eee' },
+      id:    n.host,
+      label: `${glyph} ${n.label || n.host}${badge}`,
+      title: buildNodeTooltip(n),
+      color: nodeColor(n),
+      font:  { color: '#eee' },
       shape: 'box',
-      x: n.x,
-      y: n.y,
+      borderWidth: healthOn && h ? 3 : 1,
+      borderWidthSelected: 3,
+      x: n.x, y: n.y,
       fixed: !!n.pinned,
-      _icon: icon,
-      _auto: !!n.auto,
-      _notes: n.notes || '',
+      _icon: icon, _auto: !!n.auto, _notes: n.notes || '', _host: n.host,
     };
   }
 
-  function edgeForServer(e) {
-    return {
-      id: e.id,
-      from: e.from_host,
-      to: e.to_host,
-      label: e.label || '',
-      color: { color: e.color || '#888' },
-      width: Math.max(1, Math.min(6, e.weight || 1)),
-      dashes: !!e.auto,
-      arrows: 'to',
-    };
+  function buildNodeTooltip(n) {
+    const h = hostHealth[n.host];
+    let tip = `<div style="padding:4px 6px;font-size:12px;max-width:240px;">`;
+    tip += `<strong>${n.host}</strong>`;
+    if (n.notes) tip += `<br><em>${n.notes}</em>`;
+    if (h && h.count) {
+      tip += `<br><span style="color:${HEALTH_COLORS[h.severity]}">`
+           + `${h.count} active alert(s) — ${h.severity}</span>`;
+    } else {
+      tip += `<br><span style="color:#3dd68c">No active alerts</span>`;
+    }
+    tip += `</div>`;
+    return tip;
   }
 
+  function buildVisEdge(e) {
+    return { id: e.id, from: e.from_host, to: e.to_host,
+             label: e.label || '',
+             color: { color: e.color || '#666', hover: '#aaa' },
+             width: Math.max(1, Math.min(6, e.weight || 1)),
+             dashes: !!e.auto, arrows: 'to' };
+  }
+
+  // ── Load topology ─────────────────────────────────────────────────────────
   async function loadTopology() {
-    status.textContent = 'loading...';
+    statusEl.textContent = 'loading...';
     try {
-      const r = await fetch('/api/topology');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const d = await r.json();
-      nodesDS.clear();
-      edgesDS.clear();
-      // Defensive dedupe: the backend already dedupes but a stale schema could
-      // still hand us duplicate hosts. vis-network throws on dup ids, which
-      // would break the whole page, so filter them out here too.
-      const seenNode = new Set();
-      const nodeItems = [];
-      for (const n of (d.nodes || [])) {
-        if (!n || !n.host || seenNode.has(n.host)) continue;
-        seenNode.add(n.host);
-        try { nodeItems.push(nodeForServer(n)); } catch (e) { console.warn('bad node', n, e); }
-      }
-      const seenEdge = new Set();
-      const edgeItems = [];
-      for (const e of (d.edges || [])) {
-        const id = e && e.id;
-        if (id == null || seenEdge.has(id)) continue;
-        if (!seenNode.has(e.from_host) || !seenNode.has(e.to_host)) continue;
-        seenEdge.add(id);
-        try { edgeItems.push(edgeForServer(e)); } catch (err) { console.warn('bad edge', e, err); }
-      }
-      nodesDS.add(nodeItems);
-      edgesDS.add(edgeItems);
-      status.textContent = `${nodeItems.length} nodes, ${edgeItems.length} edges`;
-      if (network) network.fit();
+      const [topoR, healthR] = await Promise.all([
+        fetch('/api/topology'),
+        fetch('/api/topology/health-overlay'),
+      ]);
+      const topo   = await topoR.json();
+      hostHealth   = healthR.ok ? await healthR.json() : {};
+      allNodes     = topo.nodes || [];
+      rebuildGraph(allNodes, topo.edges || []);
+      statusEl.textContent = `${nodesDS.length} nodes · ${edgesDS.length} edges`;
     } catch (e) {
-      status.textContent = 'error: ' + e;
-      console.error('topology load failed', e);
+      statusEl.textContent = 'load error: ' + e;
     }
   }
 
+  function rebuildGraph(nodes, edges) {
+    const search = currentSearch.toLowerCase();
+    const typeF  = currentTypeFilter;
+    nodesDS.clear(); edgesDS.clear();
+    const seen = new Set();
+    const visNodes = [];
+    for (const n of nodes) {
+      if (!n || !n.host || seen.has(n.host)) continue;
+      if (typeF  && (n.icon || 'server').toLowerCase() !== typeF) continue;
+      if (search && !n.host.toLowerCase().includes(search)
+                 && !(n.label || '').toLowerCase().includes(search)) continue;
+      seen.add(n.host);
+      try { visNodes.push(buildVisNode(n)); } catch {}
+    }
+    nodesDS.add(visNodes);
+    for (const e of edges) {
+      if (!e || !e.id || !seen.has(e.from_host) || !seen.has(e.to_host)) continue;
+      try { edgesDS.add(buildVisEdge(e)); } catch {}
+    }
+  }
+
+  // ── Refresh health overlay without full reload ────────────────────────────
+  async function refreshHealthOverlay() {
+    try {
+      const r = await fetch('/api/topology/health-overlay');
+      if (!r.ok) return;
+      hostHealth = await r.json();
+      // Update node borders/badges in place
+      const updates = allNodes
+        .filter(n => n && n.host && nodesDS.get(n.host))
+        .map(n => ({
+          id:    n.host,
+          color: nodeColor(n),
+          borderWidth: healthOn && hostHealth[n.host] ? 3 : 1,
+          title: buildNodeTooltip(n),
+        }));
+      nodesDS.update(updates);
+    } catch {}
+  }
+
+  // ── Save / delete ─────────────────────────────────────────────────────────
   async function saveNode(host, patch) {
-    const body = Object.assign({host}, patch);
     const r = await fetch('/api/topology/node', {
       method: 'PUT', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(body),
+      body: JSON.stringify({ host, ...patch }),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
   }
 
   async function deleteNode(host) {
-    if (!confirm(`Delete ${host} from topology? (host data is preserved)`)) return;
-    const r = await fetch(`/api/topology/node/${encodeURIComponent(host)}`, {method: 'DELETE'});
+    if (!confirm(`Remove ${host} from the topology map? (event data is kept)`)) return;
+    const r = await fetch(`/api/topology/node/${encodeURIComponent(host)}`, { method: 'DELETE' });
     if (!r.ok) { alert('delete failed'); return; }
     nodesDS.remove(host);
-    edgesDS.forEach(e => { if (e.from === host || e.to === host) edgesDS.remove(e.id); });
+    edgesDS.getIds().forEach(id => {
+      const e = edgesDS.get(id);
+      if (e.from === host || e.to === host) edgesDS.remove(id);
+    });
+    setSelPanel('<span class="text-muted">Node removed.</span>');
   }
 
   async function createEdge(a, b) {
     try {
       const r = await fetch('/api/topology/edge', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({from_host: a, to_host: b}),
+        body: JSON.stringify({ from_host: a, to_host: b }),
       });
-      if (r.status === 409) { status.textContent = 'edge already exists'; return; }
+      if (r.status === 409) { statusEl.textContent = 'edge already exists'; return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const d = await r.json();
-      edgesDS.add(edgeForServer({id: d.id, from_host: a, to_host: b}));
-      status.textContent = `linked ${a} -> ${b}`;
+      edgesDS.add(buildVisEdge({ id: d.id, from_host: a, to_host: b }));
+      statusEl.textContent = `linked: ${a} → ${b}`;
     } catch (e) { alert('link failed: ' + e); }
   }
 
   async function deleteEdge(id) {
     if (!confirm('Delete this edge?')) return;
-    const r = await fetch(`/api/topology/edge/${id}`, {method: 'DELETE'});
+    const r = await fetch(`/api/topology/edge/${id}`, { method: 'DELETE' });
     if (!r.ok) { alert('delete failed'); return; }
     edgesDS.remove(id);
+    setSelPanel('<span class="text-muted">Edge deleted.</span>');
   }
 
-  function showSelection(params) {
-    if (params.nodes && params.nodes.length) {
-      const id = params.nodes[0];
-      const n = nodesDS.get(id);
-      selPanel.innerHTML = `
-        <div><strong>${escapeHtml(id)}</strong> ${n._auto ? '<span class="text-muted">(auto)</span>' : ''}</div>
-        <div class="form-row">
-          <label>Label <input id="sel-label" value="${escapeHtml((n.label||'').replace(/^.\u00a0?/, ''))}"></label>
-          <label>Icon
-            <select id="sel-icon">
-              ${ICONS.map(i => `<option value="${i}" ${i===n._icon?'selected':''}>${i}</option>`).join('')}
-            </select>
-          </label>
-          <label>Color <input id="sel-color" type="color" value="${(n.color && n.color.background) || '#8b9dc3'}"></label>
-          <label class="check"><input type="checkbox" id="sel-pinned" ${n.fixed?'checked':''}> pinned</label>
-        </div>
-        <div class="form-row">
-          <label style="flex:1;">Notes <input id="sel-notes" value="${escapeHtml(n._notes||'')}"></label>
-        </div>
-        <div class="row-end">
-          <a class="ghost" href="/host/${encodeURIComponent(id)}">Open host page</a>
-          <button id="sel-save">Save</button>
-          <button id="sel-delete" class="danger">Remove from map</button>
-        </div>
-      `;
-      document.getElementById('sel-save').addEventListener('click', async () => {
-        const newLabel = document.getElementById('sel-label').value;
-        const newIcon  = document.getElementById('sel-icon').value;
-        const newColor = document.getElementById('sel-color').value;
-        const newPinned = document.getElementById('sel-pinned').checked;
-        const newNotes  = document.getElementById('sel-notes').value;
-        try {
-          await saveNode(id, {label: newLabel, icon: newIcon, color: newColor,
-                              pinned: newPinned, notes: newNotes});
-          await loadTopology();
-        } catch (e) { alert('save failed: ' + e); }
+  // ── Selection panel ───────────────────────────────────────────────────────
+  function setSelPanel(html) { document.getElementById('sel-content').innerHTML = html; }
+
+  async function showNodePanel(host) {
+    const n = nodesDS.get(host);
+    if (!n) return;
+    const h = hostHealth[host];
+    const alertBadge = h
+      ? `<span class="alert-badge sev-${h.severity}">${h.count} alert(s) — ${h.severity}</span>`
+      : `<span class="alert-badge sev-none">no active alerts</span>`;
+    setSelPanel(`<div class="node-panel">
+      <h3>${esc(host)} ${alertBadge}</h3>
+      <div class="field">Label <input id="sp-label" value="${esc((n.label||'').replace(/^.\s?/,''))}"></div>
+      <div class="field">Icon
+        <select id="sp-icon">${ICONS.map(i=>`<option value="${i}"${i===n._icon?' selected':''}>${i}</option>`).join('')}</select>
+      </div>
+      <div class="field">Color <input id="sp-color" type="color" value="${(n.color?.background)||'#8b9dc3'}"></div>
+      <div class="field" style="flex-direction:row;align-items:center;gap:.4rem;">
+        <input type="checkbox" id="sp-pinned" ${n.fixed?'checked':''}> pinned
+      </div>
+      <div class="field">Notes <input id="sp-notes" value="${esc(n._notes)}"></div>
+      <div style="display:flex;gap:.4rem;margin-top:.6rem;flex-wrap:wrap;">
+        <button class="btn" style="font-size:.75rem" onclick="saveNodePanel('${esc(host)}')">Save</button>
+        <a class="btn ghost" style="font-size:.75rem" href="/host/${encodeURIComponent(host)}">Open host page</a>
+        <button class="btn ghost danger" style="font-size:.75rem" onclick="deleteNode('${esc(host)}')">Remove</button>
+      </div>
+    </div>`);
+  }
+
+  async function saveNodePanel(host) {
+    try {
+      await saveNode(host, {
+        label:  document.getElementById('sp-label').value,
+        icon:   document.getElementById('sp-icon').value,
+        color:  document.getElementById('sp-color').value,
+        pinned: document.getElementById('sp-pinned').checked,
+        notes:  document.getElementById('sp-notes').value,
       });
-      document.getElementById('sel-delete').addEventListener('click', () => deleteNode(id));
-    } else if (params.edges && params.edges.length) {
-      const id = params.edges[0];
-      const e = edgesDS.get(id);
-      selPanel.innerHTML = `
-        <div><strong>${escapeHtml(e.from)}</strong> &rarr; <strong>${escapeHtml(e.to)}</strong></div>
-        ${e.dashes ? '<div class="text-muted small">auto-discovered</div>' : ''}
-        <div class="row-end"><button id="edge-delete" class="danger">Delete edge</button></div>
-      `;
-      document.getElementById('edge-delete').addEventListener('click', () => deleteEdge(id));
-    } else {
-      selPanel.innerHTML = '<span class="text-muted">click a node or edge</span>';
-    }
+      await loadTopology();
+    } catch (e) { alert('save failed: ' + e); }
   }
 
-  function init() {
-    network = new vis.Network(canvas, {nodes: nodesDS, edges: edgesDS}, {
-      physics: { enabled: false },
-      interaction: { hover: true, multiselect: false, dragNodes: true },
-      nodes: { borderWidth: 2 },
-      edges: { smooth: { type: 'continuous' } },
+  function showEdgePanel(edgeId) {
+    const e = edgesDS.get(edgeId);
+    if (!e) return;
+    setSelPanel(`<div class="node-panel">
+      <h3>${esc(e.from)} → ${esc(e.to)}</h3>
+      ${e.dashes ? '<p class="text-muted" style="font-size:.75rem;">auto-discovered (LLDP/learned)</p>' : ''}
+      <button class="btn ghost danger" style="font-size:.75rem;margin-top:.4rem;"
+              onclick="deleteEdge(${edgeId})">Delete edge</button>
+    </div>`);
+  }
+
+  // ── vis-network init ──────────────────────────────────────────────────────
+  function initNetwork() {
+    network = new vis.Network(canvas, { nodes: nodesDS, edges: edgesDS }, {
+      physics:     { enabled: false },
+      interaction: { hover: true, multiselect: false, dragNodes: true, tooltipDelay: 250 },
+      nodes:       { borderWidth: 1, borderWidthSelected: 3 },
+      edges:       { smooth: { type: 'continuous' } },
     });
 
-    network.on('click', (params) => {
+    network.on('click', params => {
       if (linkMode && params.nodes.length === 1) {
         const id = params.nodes[0];
-        if (!pendingFromHost) {
-          pendingFromHost = id;
-          status.textContent = `link mode: from ${id} ... click another node`;
+        if (!pendingFrom) {
+          pendingFrom = id;
+          statusEl.textContent = `link mode — from: ${id} … click second node`;
           return;
         }
-        if (pendingFromHost === id) {
-          pendingFromHost = null;
-          status.textContent = 'link mode: cancelled';
-          return;
-        }
-        createEdge(pendingFromHost, id);
-        pendingFromHost = null;
-        status.textContent = 'link mode: pick first node';
+        if (pendingFrom === id) { pendingFrom = null; statusEl.textContent = 'link mode — cancelled'; return; }
+        createEdge(pendingFrom, id);
+        pendingFrom = null;
         return;
       }
-      showSelection(params);
+      if (params.nodes.length) showNodePanel(params.nodes[0]);
+      else if (params.edges.length) showEdgePanel(params.edges[0]);
+      else setSelPanel('<span class="text-muted">Click a node or edge to inspect it.</span>');
     });
 
-    network.on('doubleClick', (params) => {
-      if (params.nodes.length === 1) {
+    network.on('doubleClick', params => {
+      if (params.nodes.length === 1)
         window.location.href = `/host/${encodeURIComponent(params.nodes[0])}`;
-      }
     });
 
-    network.on('dragEnd', (params) => {
+    network.on('dragEnd', params => {
       if (!params.nodes.length) return;
-      const positions = network.getPositions(params.nodes);
-      clearTimeout(dragSaveTimer);
-      dragSaveTimer = setTimeout(async () => {
-        for (const id of Object.keys(positions)) {
-          const p = positions[id];
-          try { await saveNode(id, {x: p.x, y: p.y}); }
-          catch (e) { console.warn('drag save failed', id, e); }
+      clearTimeout(dragTimer);
+      const pos = network.getPositions(params.nodes);
+      dragTimer = setTimeout(async () => {
+        for (const id of Object.keys(pos)) {
+          try { await saveNode(id, { x: pos[id].x, y: pos[id].y }); }
+          catch {}
         }
-        status.textContent = 'positions saved';
-      }, 250);
+        statusEl.textContent = 'positions saved';
+      }, 300);
     });
 
-    network.on('oncontext', (params) => {
+    network.on('oncontext', params => {
       params.event.preventDefault();
       const id = network.getNodeAt(params.pointer.DOM);
-      if (id) { network.selectNodes([id]); showSelection({nodes:[id], edges:[]}); }
+      if (id) { network.selectNodes([id]); showNodePanel(id); }
     });
   }
 
-  btnLink.addEventListener('click', () => {
-    linkMode = !linkMode;
-    pendingFromHost = null;
-    btnLink.textContent = `Link mode: ${linkMode ? 'on' : 'off'}`;
-    btnLink.classList.toggle('active', linkMode);
-    status.textContent = linkMode ? 'link mode: pick first node' : '';
+  // ── Toolbar buttons ───────────────────────────────────────────────────────
+  document.getElementById('btn-link-mode').addEventListener('click', () => {
+    linkMode = !linkMode; pendingFrom = null;
+    document.getElementById('link-state').textContent = linkMode ? 'ON' : 'off';
+    document.getElementById('btn-link-mode').classList.toggle('active', linkMode);
+    statusEl.textContent = linkMode ? 'link mode — click first node' : '';
   });
 
-  btnPhys.addEventListener('click', () => {
+  document.getElementById('btn-physics').addEventListener('click', () => {
     physicsOn = !physicsOn;
-    btnPhys.textContent = `Physics: ${physicsOn ? 'on' : 'off'}`;
-    btnPhys.classList.toggle('active', physicsOn);
+    document.getElementById('phys-state').textContent = physicsOn ? 'ON' : 'off';
+    document.getElementById('btn-physics').classList.toggle('active', physicsOn);
     network.setOptions({ physics: { enabled: physicsOn } });
   });
 
-  btnAdd.addEventListener('click', async () => {
-    const host = prompt('Host (IP or DNS name):');
-    if (!host) return;
-    try {
-      await saveNode(host.trim(), {icon: 'server'});
-      await loadTopology();
-    } catch (e) { alert('add failed: ' + e); }
+  document.getElementById('btn-health').addEventListener('click', async () => {
+    healthOn = !healthOn;
+    document.getElementById('health-state').textContent = healthOn ? 'ON' : 'off';
+    document.getElementById('btn-health').classList.toggle('active', healthOn);
+    await refreshHealthOverlay();
   });
 
-  btnFit.addEventListener('click', () => network && network.fit());
-  btnReload.addEventListener('click', loadTopology);
+  document.getElementById('btn-discover').addEventListener('click', async btn => {
+    const b = document.getElementById('btn-discover');
+    b.disabled = true; b.textContent = '🔍 Discovering…';
+    try {
+      const r = await fetch('/api/topology/discover', { method: 'POST' });
+      const d = await r.json();
+      statusEl.textContent = d.message || 'Discovery started';
+    } catch (e) { statusEl.textContent = 'discovery error: ' + e; }
+    finally { b.disabled = false; b.innerHTML = '🔍 Auto-discover'; }
+  });
 
-  init();
-  loadTopology();
+  document.getElementById('btn-fit').addEventListener('click', () => network?.fit());
+  document.getElementById('btn-reload').addEventListener('click', loadTopology);
+
+  document.getElementById('btn-add-node').addEventListener('click', async () => {
+    const host = prompt('Host (IP or DNS name):');
+    if (!host?.trim()) return;
+    try { await saveNode(host.trim(), { icon: 'server' }); await loadTopology(); }
+    catch (e) { alert('add failed: ' + e); }
+  });
+
+  // ── Search + type filter ──────────────────────────────────────────────────
+  const topoSearch = document.getElementById('topo-search');
+  const typeFilter = document.getElementById('type-filter');
+
+  function applyFilters() {
+    currentSearch = topoSearch.value.trim();
+    currentTypeFilter = typeFilter.value;
+    rebuildGraph(allNodes, []);   // quick client-side rebuild
+    // Re-add edges for visible nodes
+    fetch('/api/topology').then(r=>r.json()).then(d=>rebuildGraph(allNodes, d.edges||[])).catch(()=>{});
+  }
+
+  topoSearch.addEventListener('input', applyFilters);
+  typeFilter.addEventListener('change', applyFilters);
+
+  // ── Real-time SSE: topology changes ──────────────────────────────────────
+  const topoEs = new EventSource('/api/topology/stream');
+  topoEs.onopen  = () => { liveEl.textContent = '● live'; liveEl.style.color = 'var(--ok)'; };
+  topoEs.onerror = () => { liveEl.textContent = '○ disconnected'; liveEl.style.color = 'var(--err)'; };
+  topoEs.onmessage = async (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.event === 'discovery_complete') {
+        statusEl.textContent = `Discovery: +${data.count} neighbour(s) found`;
+        await loadTopology();   // full reload to pick up new nodes/edges
+      } else if (data.event === 'node_added' && data.host) {
+        if (!nodesDS.get(data.host)) {
+          nodesDS.add({ id: data.host, label: `■ ${data.host}`, shape: 'box',
+                         color: { background: '#8b9dc3', border: '#333' },
+                         font: { color: '#eee' } });
+        }
+      } else if (data.event === 'edge_added') {
+        await loadTopology();
+      }
+    } catch {}
+  };
+
+  // ── Correlation incidents ─────────────────────────────────────────────────
+  const corrMount = document.getElementById('corr-mount');
+  window.loadCorrelation = async function() {
+    try {
+      const r = await fetch('/api/correlation/incidents?limit=5');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      if (!d.incidents?.length) {
+        corrMount.innerHTML = '<span class="text-muted">No correlated incidents in the last scan window.</span>';
+        return;
+      }
+      corrMount.innerHTML = d.incidents.map(inc => `
+        <div class="corr-card sev-${inc.severity}">
+          <div class="corr-title">${esc(inc.title)}</div>
+          <div class="corr-meta">
+            <strong>${(inc.confidence*100).toFixed(0)}%</strong> confidence ·
+            pattern: <code>${esc(inc.pattern_matched)}</code> ·
+            ${new Date(inc.detected_at).toLocaleString()} ·
+            hosts: ${(inc.affected_hosts||[]).map(h=>esc(h)).join(', ')||'—'}
+          </div>
+          <div class="corr-root">${esc(inc.root_cause)}</div>
+          ${(inc.recommended_actions||[]).length
+            ? `<ul style="margin:.3rem 0 0 1rem;font-size:.75rem;color:var(--text-muted);">`
+              + inc.recommended_actions.slice(0,2).map(a=>`<li>${esc(a)}</li>`).join('')
+              + `</ul>`
+            : ''}
+          <button class="btn ghost" style="font-size:.7rem;margin-top:.4rem;"
+                  onclick="ackIncident(${inc.id}, this)"> ✓ Acknowledge</button>
+        </div>`
+      ).join('');
+    } catch (e) {
+      corrMount.innerHTML = `<span style="color:var(--err)">Error: ${esc(String(e))}</span>`;
+    }
+  };
+
+  window.ackIncident = async function(id, btn) {
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/correlation/incidents/${id}/acknowledge`, { method: 'POST' });
+      if (r.ok) { btn.closest('.corr-card').style.opacity = '.4'; btn.textContent = 'acknowledged'; }
+      else btn.disabled = false;
+    } catch { btn.disabled = false; }
+  };
+
+  // SSE for new correlation incidents
+  const corrEs = new EventSource('/api/correlation/stream');
+  corrEs.onmessage = () => { loadCorrelation(); };
+  document.getElementById('corr-live').style.color =
+    corrEs.readyState === 0 ? 'var(--ok)' : 'var(--err)';
+
+  // ── Highlight nodes containing correlated incident hosts ─────────────────
+  async function highlightIncidentHosts() {
+    try {
+      const r = await fetch('/api/correlation/incidents?limit=3');
+      if (!r.ok) return;
+      const d = await r.json();
+      const affectedHosts = new Set(d.incidents.flatMap(i => i.affected_hosts || []));
+      const updates = [];
+      nodesDS.forEach(node => {
+        if (affectedHosts.has(node.id)) {
+          updates.push({ id: node.id, borderWidthSelected: 4 });
+        }
+      });
+      if (updates.length) nodesDS.update(updates);
+    } catch {}
+  }
+
+  function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // ── Health auto-refresh every 60s ─────────────────────────────────────────
+  setInterval(refreshHealthOverlay, 60000);
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  initNetwork();
+  loadTopology().then(highlightIncidentHosts);
+  loadCorrelation();
 })();
 </script>
 {% endblock %}
