@@ -293,11 +293,20 @@ def _is_loopback(ip: str | None) -> bool:
         return False
 
 
-async def current_user(
+async def _resolve_principal(
     request: Request,
-    loglm_session: Optional[str] = Cookie(default=None),
+    cookie_value: str | None,
 ) -> Principal:
-    """Primary dependency used by protected routes."""
+    """
+    Core auth resolution logic — shared by both the FastAPI dependency
+    (current_user) and the HTTP middleware (resolve_principal_from_request).
+
+    Kept separate because FastAPI's Cookie() dependency annotation must only
+    appear on the public dependency function; calling current_user() directly
+    from middleware bypasses FastAPI DI and leaves loglm_session bound to the
+    Cookie FieldInfo object rather than the actual cookie string, causing
+    itsdangerous to raise TypeError: argument of type 'Cookie' is not iterable.
+    """
     if AUTH_DISABLED:
         return ANON_DISABLED
 
@@ -306,6 +315,7 @@ async def current_user(
         return ANON_LOOPBACK
 
     pool = request.app.state.pool
+
     # API key: Authorization: Bearer loglm_xxx  OR  X-API-Key: loglm_xxx
     auth_header = request.headers.get("authorization") or ""
     api_key = None
@@ -318,12 +328,42 @@ async def current_user(
         if p:
             return p
 
-    if loglm_session:
-        p = await resolve_session(pool, loglm_session)
+    # Session cookie: must be a plain str extracted from the request/DI system.
+    # Never pass a FastAPI FieldInfo (Cookie(...)) object here.
+    if cookie_value and isinstance(cookie_value, str):
+        p = await resolve_session(pool, cookie_value)
         if p:
             return p
 
     raise HTTPException(status_code=401, detail="authentication required")
+
+
+async def resolve_principal_from_request(request: Request) -> Principal:
+    """
+    Resolve the authenticated principal by reading cookies/headers directly
+    from the Starlette Request object.
+
+    Use this from HTTP middleware where FastAPI's dependency injection is NOT
+    active. Do NOT use current_user() from middleware — its Cookie() default
+    value is a FieldInfo object, not None, which causes a TypeError inside
+    itsdangerous when the signer tries to iterate over it.
+    """
+    cookie_value: str | None = request.cookies.get(SESSION_COOKIE)
+    return await _resolve_principal(request, cookie_value)
+
+
+async def current_user(
+    request: Request,
+    loglm_session: Optional[str] = Cookie(default=None),
+) -> Principal:
+    """
+    FastAPI dependency for protected routes — inject with Depends(current_user).
+
+    FastAPI resolves the Cookie() annotation and passes the actual cookie
+    string (or None) as loglm_session. Do NOT call this function directly
+    from middleware; use resolve_principal_from_request() instead.
+    """
+    return await _resolve_principal(request, loglm_session)
 
 
 async def require_admin(user: Principal = Depends(current_user)) -> Principal:

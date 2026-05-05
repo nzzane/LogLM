@@ -292,29 +292,99 @@ async def get_feedback_examples(pool: asyncpg.Pool, limit: int = 20) -> list[dic
         return []
 
 
-def build_feedback_block(rows: list[dict]) -> str:
-    if not rows:
-        return ""
-    important = [r for r in rows if r.get("verdict") == "important"][:10]
-    ignore    = [r for r in rows if r.get("verdict") == "ignore"][:10]
-    if not important and not ignore:
-        return ""
-    parts = ["\nUSER-FLAGGED TRAINING EXAMPLES (treat similar lines accordingly):"]
-    if important:
-        parts.append("Marked IMPORTANT (alert on similar):")
-        for r in important:
-            host = (r.get("host") or "?")[:30]
-            prog = (r.get("program") or "?")[:20]
-            pat = (r.get("pattern") or "")[:160]
-            parts.append(f'  - {host} {prog}: "{pat}"')
-    if ignore:
-        parts.append("Marked IGNORE (do NOT alert on similar, even if rules match):")
-        for r in ignore:
-            host = (r.get("host") or "?")[:30]
-            prog = (r.get("program") or "?")[:20]
-            pat = (r.get("pattern") or "")[:160]
-            parts.append(f'  - {host} {prog}: "{pat}"')
-    return "\n".join(parts)
+async def get_alert_feedback_examples(pool: asyncpg.Pool, limit: int = 20) -> list[dict]:
+    """
+    Fetch recent human-verdicted alerts (important / ignored) to use as
+    alert-level in-context training examples.
+
+    These are distinct from event_feedback (which operates on raw log lines).
+    Alert feedback reflects the operator's opinion on the *LLM output* — whole
+    alert objects with categories. Injecting them into the Tier 2 prompt
+    teaches the model what constitutes signal vs. noise for this specific network.
+
+    Empty list is returned gracefully so callers don't need to handle failures.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT user_verdict, title, affected_hosts,
+                          recommended_action, user_verdict_at,
+                          raw_result->>'category' AS category
+                   FROM alerts
+                   WHERE user_verdict IN ('important', 'ignored')
+                   ORDER BY user_verdict_at DESC NULLS LAST
+                   LIMIT $1""",
+                limit,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.debug(f"alert feedback fetch failed: {e}")
+        return []
+
+
+def build_feedback_block(event_rows: list[dict], alert_rows: list[dict] | None = None) -> str:
+    """
+    Build the USER-FLAGGED TRAINING EXAMPLES block injected at the end of
+    every Tier 2 system prompt.
+
+    Two levels of feedback:
+      1. Event-level (event_feedback table) — raw log line patterns.
+      2. Alert-level (alerts.user_verdict)  — whole LLM alert verdicts.
+
+    Both use the same prompt injection mechanism. Alert-level examples come
+    LAST so they take priority over event-level rules for alert decisions.
+    """
+    parts: list[str] = []
+
+    # ── Event-level feedback ─────────────────────────────────────────────────
+    if event_rows:
+        important_ev = [r for r in event_rows if r.get("verdict") == "important"][:10]
+        ignore_ev    = [r for r in event_rows if r.get("verdict") == "ignore"][:10]
+        if important_ev or ignore_ev:
+            parts.append("\nUSER-FLAGGED LOG TRAINING EXAMPLES (treat similar lines accordingly):")
+            if important_ev:
+                parts.append("Marked IMPORTANT (alert on similar):")
+                for r in important_ev:
+                    host = (r.get("host") or "?")[:30]
+                    prog = (r.get("program") or "?")[:20]
+                    pat  = (r.get("pattern") or "")[:160]
+                    parts.append(f'  - {host} {prog}: "{pat}"')
+            if ignore_ev:
+                parts.append("Marked IGNORE (do NOT alert on similar, even if rules match):")
+                for r in ignore_ev:
+                    host = (r.get("host") or "?")[:30]
+                    prog = (r.get("program") or "?")[:20]
+                    pat  = (r.get("pattern") or "")[:160]
+                    parts.append(f'  - {host} {prog}: "{pat}"')
+
+    # ── Alert-level feedback ─────────────────────────────────────────────────
+    if alert_rows:
+        important_al = [r for r in alert_rows if r.get("user_verdict") == "important"][:10]
+        ignored_al   = [r for r in alert_rows if r.get("user_verdict") == "ignored"][:10]
+        if important_al or ignored_al:
+            parts.append(
+                "\nUSER-FLAGGED ALERT VERDICTS (these override event-level rules):"
+            )
+            if important_al:
+                parts.append(
+                    "ALWAYS ALERT on these (operator confirmed these are real issues):"
+                )
+                for r in important_al:
+                    cat   = (r.get("category") or "?")[:40]
+                    title = (r.get("title") or "?")[:80]
+                    hosts = ", ".join((r.get("affected_hosts") or [])[:3]) or "?"
+                    parts.append(f'  - [{cat}] "{title}" on {hosts}')
+            if ignored_al:
+                parts.append(
+                    "SUPPRESS / DO NOT ALERT on these (operator confirmed these are noise):"
+                )
+                for r in ignored_al:
+                    cat   = (r.get("category") or "?")[:40]
+                    title = (r.get("title") or "?")[:80]
+                    hosts = ", ".join((r.get("affected_hosts") or [])[:3]) or "?"
+                    parts.append(f'  - [{cat}] "{title}" on {hosts}')
+
+    return "\n".join(parts) if parts else ""
 
 
 async def call_ollama(http_client: httpx.AsyncClient, prompt: str,
@@ -618,7 +688,8 @@ async def analyze_loop(redis_client, pool: asyncpg.Pool, http_client: httpx.Asyn
         log.info(f"Analyzing {total_events} events across {sum(1 for v in stream_events.values() if v)} streams")
         aliases = await get_aliases(pool)
         feedback = await get_feedback_examples(pool)
-        feedback_block = build_feedback_block(feedback)
+        alert_feedback = await get_alert_feedback_examples(pool)
+        feedback_block = build_feedback_block(feedback, alert_rows=alert_feedback)
 
         # Process each stream independently — each gets its own prompt and can
         # emit its own alert. ACK happens after each stream is processed.

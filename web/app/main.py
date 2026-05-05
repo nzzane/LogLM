@@ -263,6 +263,15 @@ async def startup():
             CREATE INDEX IF NOT EXISTS idx_alerts_unacked_ls
                 ON alerts (last_seen DESC) WHERE NOT acknowledged;
 
+            -- User feedback on individual alerts (important / ignored).
+            -- user_verdict=NULL means no human opinion yet.
+            -- Ignored alerts are kept in the DB so they can be reviewed and restored.
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_verdict      TEXT;
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_verdict_at   TIMESTAMPTZ;
+            ALTER TABLE alerts ADD COLUMN IF NOT EXISTS user_verdict_by   TEXT;
+            CREATE INDEX IF NOT EXISTS idx_alerts_user_verdict
+                ON alerts (user_verdict) WHERE user_verdict IS NOT NULL;
+
             -- Runtime-editable key-value settings (Ollama URLs, model names, etc.)
             CREATE TABLE IF NOT EXISTS loglm_settings (
                 key        TEXT PRIMARY KEY,
@@ -313,6 +322,20 @@ async def startup():
     observability.install(app, OLLAMA_URL, LOKI_URL)
     await auth.bootstrap_admin(_pool)
 
+    # Restore persisted ignored alert cooldown_keys into Redis on every startup.
+    # This prevents ignored alert rules from silently evaporating on container restart.
+    try:
+        async with _pool.acquire() as conn:
+            ignored_rows = await conn.fetch(
+                "SELECT cooldown_key FROM alerts "
+                "WHERE user_verdict = 'ignored' AND cooldown_key IS NOT NULL"
+            )
+        if ignored_rows:
+            keys = [r["cooldown_key"] for r in ignored_rows]
+            await _redis.sadd("loglm:ignored_alert_keys", *keys)
+    except Exception as _e:
+        print(f"[web] ignored_alert_keys restore failed: {_e}")
+
     global _docker
     if docker_sdk is not None:
         try:
@@ -332,7 +355,12 @@ async def auth_middleware(request: Request, call_next):
     if path in _AUTH_OPEN_PATHS or path.startswith("/static"):
         return await call_next(request)
     try:
-        principal = await auth.current_user(request)
+        # Use resolve_principal_from_request() — NOT current_user() — because
+        # FastAPI DI is inactive here. current_user() has a Cookie() default
+        # that evaluates to a FieldInfo object (not None), which is truthy and
+        # gets forwarded to itsdangerous, causing:
+        #   TypeError: argument of type 'Cookie' is not iterable
+        principal = await auth.resolve_principal_from_request(request)
         request.state.user = principal
     except HTTPException:
         if path.startswith("/api/"):
@@ -677,20 +705,56 @@ async def logs(
 # ── Alerts ────────────────────────────────────────────────────────────────────
 
 @app.get("/alerts", response_class=HTMLResponse)
-async def alert_history(request: Request, page: int = 1):
+async def alert_history(
+    request: Request,
+    page: int = 1,
+    show_ignored: int = Query(default=0, ge=0, le=1),
+):
     limit = 50
     offset = (page - 1) * limit
     async with _pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM alerts ORDER BY COALESCE(last_seen, timestamp) DESC LIMIT $1 OFFSET $2",
-            limit, offset,
-        )
-        total = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+        if show_ignored:
+            # Show ONLY alerts the user has marked as ignored
+            rows = await conn.fetch(
+                """SELECT * FROM alerts
+                   WHERE user_verdict = 'ignored'
+                   ORDER BY user_verdict_at DESC NULLS LAST
+                   LIMIT $1 OFFSET $2""",
+                limit, offset,
+            )
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM alerts WHERE user_verdict = 'ignored'"
+            )
+        else:
+            # Default: hide ignored alerts (they're dismissed noise — show them on demand)
+            rows = await conn.fetch(
+                """SELECT * FROM alerts
+                   WHERE (user_verdict IS NULL OR user_verdict != 'ignored')
+                   ORDER BY COALESCE(last_seen, timestamp) DESC
+                   LIMIT $1 OFFSET $2""",
+                limit, offset,
+            )
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM alerts WHERE (user_verdict IS NULL OR user_verdict != 'ignored')"
+            )
     return templates.TemplateResponse("alerts.html", {
-        "request": request,
-        "alerts": [dict(r) for r in rows],
-        "page": page, "total": total, "limit": limit,
+        "request":      request,
+        "alerts":       [dict(r) for r in rows],
+        "page":         page,
+        "total":        total,
+        "limit":        limit,
+        "show_ignored": bool(show_ignored),
     })
+
+
+@app.get("/api/alerts/ignored-count")
+async def api_alerts_ignored_count():
+    """Returns the count of alerts with user_verdict='ignored' for the UI badge."""
+    async with _pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM alerts WHERE user_verdict = 'ignored'"
+        )
+    return JSONResponse({"count": count})
 
 
 @app.post("/alerts/{alert_id}/acknowledge")
@@ -783,6 +847,156 @@ async def api_alert_ignore(alert_id: int, req: AlertIgnoreRequest | None = None)
 
     _STATS_CACHE["data"] = None
     return JSONResponse({"ok": True, "hosts": hosts, "pattern": pattern})
+
+
+# ── Alert-level user feedback (important / ignored / restore) ─────────────────
+#
+# This is the alert-level learning loop. Unlike event_feedback (which classifies
+# raw log lines), alert_verdict operates on the LLM's output: whole alert objects
+# with categories, titles, and affected hosts. It feeds back into Tier 2 via
+# in-context examples injected into every analysis batch prompt.
+#
+# Lifecycle:
+#   mark ignored → alerts.user_verdict='ignored'
+#                → cooldown_key added to Redis loglm:ignored_alert_keys
+#                → future matching alerts suppressed in analyze_loop
+#                → alert stays in DB (visible via ?show_ignored=1)
+#
+#   mark important → alerts.user_verdict='important'
+#                  → injected as "always alert" example in Tier 2 prompt
+#
+#   restore → alerts.user_verdict=NULL
+#           → cooldown_key removed from Redis loglm:ignored_alert_keys
+#           → alert reverts to normal visibility
+#
+# The ignored/important examples are loaded by the analyzer via
+# GET /api/alert-feedback/context and injected at the bottom of every
+# Tier 2 system prompt.
+
+class AlertVerdictRequest(BaseModel):
+    verdict: str          # "important" | "ignored" | "restore"
+    username: str | None = None  # who made the decision (optional, from UI)
+
+
+@app.post("/api/alerts/{alert_id}/verdict")
+async def api_alert_verdict(alert_id: int, req: AlertVerdictRequest):
+    """
+    Set or clear the user_verdict on an alert.
+
+    verdict='ignored'   → suppresses future matching alerts; alert stays visible
+                          under ?show_ignored=1 so the decision can be reviewed.
+    verdict='important' → tags for priority; injected as in-context training
+                          into the Tier 2 LLM prompt.
+    verdict='restore'   → clears any verdict; re-activates alert in the normal view.
+    """
+    if req.verdict not in ("important", "ignored", "restore"):
+        raise HTTPException(400, "verdict must be 'important', 'ignored', or 'restore'")
+
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, title, category, affected_hosts, cooldown_key, user_verdict "
+            "FROM alerts WHERE id=$1",
+            alert_id,
+        )
+        if not row:
+            raise HTTPException(404, "alert not found")
+
+        new_verdict = None if req.verdict == "restore" else req.verdict
+        await conn.execute(
+            """UPDATE alerts
+               SET user_verdict=$1, user_verdict_at=NOW(), user_verdict_by=$2
+               WHERE id=$3""",
+            new_verdict,
+            (req.username or "web-ui")[:100],
+            alert_id,
+        )
+
+    cooldown_key = row.get("cooldown_key") or ""
+
+    if req.verdict == "ignored":
+        # Add to Redis suppression set so the running analyzer sees it immediately
+        if cooldown_key:
+            try:
+                await _redis.sadd("loglm:ignored_alert_keys", cooldown_key)
+            except Exception as e:
+                log.warning(f"ignored_alert_keys sadd failed: {e}")
+        # Also inject the event-level feedback row so Tier 1 learns too
+        try:
+            hosts = list(row.get("affected_hosts") or []) or [""]
+            pattern = (row.get("title") or "")[:200]
+            async with _pool.acquire() as conn:
+                for h in hosts:
+                    await conn.execute(
+                        """INSERT INTO event_feedback
+                               (event_id, host, program, pattern, verdict)
+                           VALUES (NULL, $1, '', $2, 'ignore')
+                           ON CONFLICT DO NOTHING""",
+                        h, pattern or "*",
+                    )
+        except Exception as e:
+            log.debug(f"alert verdict → event_feedback insert failed: {e}")
+
+    elif req.verdict == "restore":
+        # Remove from Redis suppression set — analyzer will stop suppressing
+        if cooldown_key:
+            try:
+                await _redis.srem("loglm:ignored_alert_keys", cooldown_key)
+            except Exception as e:
+                log.warning(f"ignored_alert_keys srem failed: {e}")
+
+    # Notify processor + analyzer to refresh their feedback caches
+    try:
+        await _redis.publish("loglm:feedback", json.dumps({
+            "verdict": req.verdict,
+            "alert_id": alert_id,
+            "cooldown_key": cooldown_key,
+        }))
+    except Exception:
+        pass
+
+    _STATS_CACHE["data"] = None
+    return JSONResponse({
+        "ok": True,
+        "alert_id": alert_id,
+        "verdict": new_verdict,
+        "cooldown_key": cooldown_key or None,
+    })
+
+
+@app.get("/api/alert-feedback/context")
+async def api_alert_feedback_context():
+    """
+    Return recent human-marked alerts for injection into the Tier 2 LLM prompt.
+
+    The analyzer calls this periodically (same cadence as event_feedback) and
+    prepends the results to every analysis batch as in-context examples:
+
+      - 'important' alerts: "If similar events occur again, always alert."
+      - 'ignored' alerts: "Future alerts matching this pattern should be suppressed."
+
+    Returns up to 20 examples (10 important + 10 ignored), most-recent first.
+    """
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT user_verdict, title, category, affected_hosts,
+                      description, recommended_action, user_verdict_at
+               FROM alerts
+               WHERE user_verdict IN ('important', 'ignored')
+               ORDER BY user_verdict_at DESC
+               LIMIT 20""",
+        )
+    return JSONResponse([
+        {
+            "verdict":           r["user_verdict"],
+            "title":             r["title"],
+            "category":          r["category"] if "category" in r.keys() else None,
+            "affected_hosts":    r["affected_hosts"] or [],
+            "description":       (r["description"] or "")[:300],
+            "recommended_action":(r["recommended_action"] or "")[:200],
+            "marked_at":         r["user_verdict_at"].isoformat() if r["user_verdict_at"] else None,
+        }
+        for r in rows
+    ])
 
 
 # ── Natural-language ignore / important rules ─────────────────────────────────

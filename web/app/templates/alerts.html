@@ -2,9 +2,37 @@
 {% block title %}Alerts · LogLM{% endblock %}
 
 {% block content %}
-<h1>Alert History</h1>
+<div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem;">
+  <h1 style="margin:0;">
+    {% if show_ignored %}
+      Ignored Alerts
+    {% else %}
+      Alert History
+    {% endif %}
+  </h1>
+  <div style="display:flex;gap:.5rem;margin-left:auto;align-items:center;">
+    {% if show_ignored %}
+      <a href="/alerts" class="btn secondary" style="font-size:.8rem;">← Active alerts</a>
+    {% else %}
+      <a href="/alerts?show_ignored=1" class="btn secondary" style="font-size:.8rem;" id="ignored-link">
+        Show ignored
+        <span id="ignored-count" style="display:none;" class="badge badge-low">…</span>
+      </a>
+    {% endif %}
+  </div>
+</div>
+
+{% if show_ignored %}
+<div class="card" style="margin-bottom:1rem;border-left:3px solid #f59e0b;">
+  <p style="margin:0;font-size:.85rem;color:var(--fg-muted);">
+    These alerts were marked as noise by a user. The LLM will not alert on matching events.
+    Click <strong>Restore</strong> to re-activate an alert and remove the suppression rule.
+  </p>
+</div>
+{% endif %}
 
 <!-- Natural language rules panel -->
+{% if not show_ignored %}
 <div class="card" style="margin-bottom:1.2rem;">
   <div class="section-header" style="cursor:pointer;" onclick="toggleRulesPanel()">
     <h2>⚙ Ignore / Importance Rules</h2>
@@ -24,11 +52,234 @@
     <div id="rules-list" style="margin-top:.8rem;"></div>
   </div>
 </div>
+{% endif %}
+
+{% if alerts %}
+  {% for alert in alerts %}
+  <div class="alert-card {{ alert.severity }} {% if alert.acknowledged %}acked{% endif %} {% if alert.user_verdict == 'important' %}verdict-important{% elif alert.user_verdict == 'ignored' %}verdict-ignored{% endif %}"
+       data-alert-id="{{ alert.id }}"
+       data-cooldown="{{ alert.cooldown_key or '' }}"
+       data-category="{{ alert.raw_result.get('category', '') if alert.raw_result else '' }}">
+
+    <div class="alert-header">
+      <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
+      <span class="alert-title">{{ alert.title }}</span>
+      {% if alert.seen_count and alert.seen_count > 1 %}
+      <span class="badge badge-count" title="Times this alert has recurred">{{ alert.seen_count }}×</span>
+      {% endif %}
+      <span class="badge badge-{{ 'ok' if alert.false_positive_risk == 'low' else ('medium' if alert.false_positive_risk == 'medium' else 'high') }}"
+            title="False positive risk">FP: {{ alert.false_positive_risk }}</span>
+
+      {% if alert.user_verdict == 'important' %}
+        <span class="verdict-badge verdict-badge-important" title="You marked this as important">★ Important</span>
+      {% elif alert.user_verdict == 'ignored' %}
+        <span class="verdict-badge verdict-badge-ignored" title="You marked this as noise">✕ Ignored</span>
+      {% endif %}
+
+      <!-- Action buttons — contextual based on current state -->
+      <span class="alert-actions" id="actions-{{ alert.id }}">
+        {% if alert.user_verdict == 'ignored' %}
+          {# Ignored view: only show Restore #}
+          <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
+                  onclick="setVerdict({{ alert.id }}, 'restore', this)">Restore</button>
+        {% else %}
+          {# Normal view: full action set #}
+          {% if not alert.acknowledged %}
+          <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
+                  onclick="ackAlert({{ alert.id }}, this)">Acknowledge</button>
+          <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
+                  title="Acknowledge AND silence future matching events from the affected hosts"
+                  onclick="ignoreWarning(this, {{ alert.id }})">Ack+Ignore</button>
+          {% else %}
+          <span class="text-muted" style="font-size:.75rem;">✓ Acknowledged</span>
+          {% endif %}
+
+          {# Feedback buttons — always shown regardless of acknowledged state #}
+          {% if alert.user_verdict != 'important' %}
+          <button class="btn verdict-btn important-btn" style="font-size:.7rem;padding:.2rem .5rem;"
+                  title="Mark as important — tell the LLM this category always warrants an alert"
+                  onclick="setVerdict({{ alert.id }}, 'important', this)">★ Important</button>
+          {% endif %}
+
+          {% if not alert.user_verdict %}
+          <button class="btn verdict-btn ignore-btn" style="font-size:.7rem;padding:.2rem .5rem;"
+                  title="Mark as noise — suppresses future matching alerts. Recoverable via 'Show ignored'."
+                  onclick="setVerdict({{ alert.id }}, 'ignored', this)">✕ Ignore</button>
+          {% endif %}
+
+          {% if alert.user_verdict %}
+          <button class="btn ghost" style="font-size:.7rem;padding:.2rem .5rem;"
+                  title="Clear feedback — revert to default LLM behaviour"
+                  onclick="setVerdict({{ alert.id }}, 'restore', this)">↩ Restore</button>
+          {% endif %}
+        {% endif %}
+      </span>
+    </div>
+
+    <div class="alert-meta">
+      First: {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} UTC
+      {% if alert.last_seen and alert.seen_count and alert.seen_count > 1 %}
+      · Last: {{ alert.last_seen.strftime('%H:%M:%S') }}
+      {% endif %}
+      · {{ alert.event_count }} events analysed
+      {% if alert.affected_hosts %}· Hosts: {{ alert.affected_hosts | join(', ') }}{% endif %}
+      {% if alert.user_verdict_by and alert.user_verdict %}
+      · <span class="text-muted" style="font-size:.72rem;">
+          {% if alert.user_verdict == 'important' %}Flagged important{% else %}Ignored{% endif %}
+          by {{ alert.user_verdict_by }}
+          {% if alert.user_verdict_at %}at {{ alert.user_verdict_at.strftime('%b %d %H:%M') }}{% endif %}
+        </span>
+      {% endif %}
+    </div>
+    <div class="alert-desc">{{ alert.description }}</div>
+    {% if alert.recommended_action %}
+    <div class="alert-action">→ <strong>Action:</strong> {{ alert.recommended_action }}</div>
+    {% endif %}
+    <div style="margin-top:.5rem;">
+      <button class="btn ghost" style="font-size:.7rem;padding:.2rem .5rem;" onclick="toggleDetail(this)">Show more</button>
+    </div>
+    <div class="alert-raw" style="display:none;margin-top:.5rem;">
+      <div style="font-size:.75rem;color:var(--fg-muted,#999);margin-bottom:.3rem;"><strong>LLM raw analysis</strong></div>
+      <pre style="white-space:pre-wrap;word-break:break-word;font-size:.72rem;background:var(--bg-inset,#1a1a2e);padding:.6rem;border-radius:6px;max-height:400px;overflow-y:auto;">{{ alert.raw_result | tojson(indent=2) if alert.raw_result else '(no raw data)' }}</pre>
+    </div>
+  </div>
+  {% endfor %}
+
+  {% set pages = (total // limit) + (1 if total % limit else 0) %}
+  {% if pages > 1 %}
+  <div class="pagination">
+    {% set base_url = '/alerts?show_ignored=1&' if show_ignored else '/alerts?' %}
+    {% if page > 1 %}<a href="{{ base_url }}page={{ page-1 }}">‹ Prev</a>{% endif %}
+    {% for p in range(1, pages+1) %}
+      {% if p == page %}<span class="current">{{ p }}</span>
+      {% else %}<a href="{{ base_url }}page={{ p }}">{{ p }}</a>{% endif %}
+    {% endfor %}
+    {% if page < pages %}<a href="{{ base_url }}page={{ page+1 }}">Next ›</a>{% endif %}
+  </div>
+  {% endif %}
+
+{% else %}
+  {% if show_ignored %}
+  <div class="empty-state card">No ignored alerts — nothing has been dismissed yet.</div>
+  {% else %}
+  <div class="empty-state card">No alerts yet — the LLM has found nothing suspicious.</div>
+  {% endif %}
+{% endif %}
+
+<style>
+/* Verdict badges inline with alert header */
+.verdict-badge {
+  display: inline-block;
+  font-size: .68rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+.verdict-badge-important { background: rgba(250,204,21,.15); color: #facc15; border: 1px solid #facc1550; }
+.verdict-badge-ignored   { background: rgba(100,100,100,.15); color: #888; border: 1px solid #44444450; }
+
+/* Alert cards with verdict-applied state */
+.alert-card.verdict-important { border-left-color: #facc15 !important; }
+.alert-card.verdict-ignored   { opacity: .65; border-left-color: #555 !important; }
+
+/* Feedback action buttons */
+.verdict-btn { opacity: .8; }
+.important-btn { color: #facc15 !important; border-color: #facc1560 !important; }
+.important-btn:hover { background: rgba(250,204,21,.1) !important; opacity: 1; }
+.ignore-btn { color: #f87171 !important; border-color: #f8717160 !important; }
+.ignore-btn:hover { background: rgba(248,113,113,.1) !important; opacity: 1; }
+</style>
 
 <script>
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function toggleDetail(btn) {
+  var d = btn.parentElement.nextElementSibling;
+  if (d.style.display === 'none') { d.style.display = 'block'; btn.textContent = 'Show less'; }
+  else { d.style.display = 'none'; btn.textContent = 'Show more'; }
+}
+
+// ── Alert feedback (important / ignored / restore) ──────────────────────────
+
+async function setVerdict(alertId, verdict, btn) {
+  const labels = { important: 'Mark as important', ignored: 'Mark as ignored', restore: 'Restoring…' };
+  const confirm_msgs = {
+    ignored: 'Mark this alert as noise? The LLM will suppress future matching alerts.\n\nYou can review and restore ignored alerts via "Show ignored".',
+    restore: 'Restore this alert? This removes any feedback (important/ignored) and re-activates normal LLM behaviour.',
+  };
+  if (confirm_msgs[verdict] && !confirm(confirm_msgs[verdict])) return;
+
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Saving…';
+
+  try {
+    const r = await fetch(`/api/alerts/${alertId}/verdict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ verdict }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'HTTP ' + r.status);
+
+    // Give visual feedback, then reload the card section
+    btn.textContent = '✓';
+    btn.style.color = '#4ade80';
+    setTimeout(() => location.reload(), 800);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = orig;
+    alert('Failed: ' + e);
+  }
+}
+
+// ── Legacy Ack+Ignore compatibility ─────────────────────────────────────────
+
+async function ackAlert(alertId, btn) {
+  btn.disabled = true;
+  btn.textContent = '...';
+  const r = await fetch(`/alerts/${alertId}/acknowledge`, { method: 'POST' });
+  if (r.ok) { btn.replaceWith(Object.assign(document.createElement('span'), { className: 'text-muted', style: 'font-size:.75rem', textContent: '✓ Acknowledged' })); }
+  else { btn.disabled = false; btn.textContent = 'Acknowledge'; }
+}
+
+async function ignoreWarning(btn, alertId) {
+  if (!confirm('Acknowledge AND suppress future matching alerts from these hosts?\n\nYou can review ignored alerts via "Show ignored".')) return;
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const r = await fetch(`/api/alerts/${alertId}/ignore`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    if (r.ok) { setTimeout(() => location.reload(), 400); }
+    else { btn.disabled = false; btn.textContent = 'Ack+Ignore'; }
+  } catch { btn.disabled = false; btn.textContent = 'Ack+Ignore'; }
+}
+
+// ── Show-ignored count badge ─────────────────────────────────────────────────
+
+async function loadIgnoredCount() {
+  const badge = document.getElementById('ignored-count');
+  if (!badge) return;
+  try {
+    const r = await fetch('/api/alerts/ignored-count');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.count > 0) {
+      badge.textContent = d.count;
+      badge.style.display = 'inline-block';
+    }
+  } catch {}
+}
+loadIgnoredCount();
+
+// ── Natural language rules (only on non-ignored view) ───────────────────────
+
 async function toggleRulesPanel() {
   const p = document.getElementById('rules-panel');
   const h = document.getElementById('rules-toggle-hint');
+  if (!p) return;
   if (p.style.display === 'none') {
     p.style.display = 'block'; h.textContent = 'click to collapse';
     await loadRules();
@@ -41,6 +292,7 @@ async function loadRules() {
   const r = await fetch('/api/rules');
   const rules = await r.json();
   const el = document.getElementById('rules-list');
+  if (!el) return;
   if (!rules.length) { el.innerHTML = '<em style="color:var(--fg-muted)">No rules yet.</em>'; return; }
   el.innerHTML = `<table style="width:100%;font-size:.78rem;border-collapse:collapse;">
     <thead><tr style="opacity:.6;text-align:left;">
@@ -58,15 +310,11 @@ async function loadRules() {
     </tr>`).join('') + '</tbody></table>';
 }
 
-function esc(s) {
-  if (!s) return '';
-  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
 async function submitNLRule() {
   const inp = document.getElementById('nl-rule-input');
   const btn = document.getElementById('nl-rule-btn');
   const res = document.getElementById('nl-rule-result');
+  if (!inp) return;
   const text = inp.value.trim();
   if (!text) return;
   btn.disabled = true; btn.textContent = 'Thinking…';
@@ -94,73 +342,6 @@ async function deleteRule(id, btn) {
   const r = await fetch(`/api/rules/${id}`, {method:'DELETE'});
   if (r.ok) await loadRules();
   else { btn.disabled = false; alert('Delete failed'); }
-}
-</script>
-
-{% if alerts %}
-  {% for alert in alerts %}
-  <div class="alert-card {{ alert.severity }} {% if alert.acknowledged %}acked{% endif %}">
-    <div class="alert-header">
-      <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
-      <span class="alert-title">{{ alert.title }}</span>
-      {% if alert.seen_count and alert.seen_count > 1 %}
-      <span class="badge badge-count" title="Times this alert has recurred">{{ alert.seen_count }}×</span>
-      {% endif %}
-      <span class="badge badge-{{ 'ok' if alert.false_positive_risk == 'low' else ('medium' if alert.false_positive_risk == 'medium' else 'high') }}"
-            title="False positive risk">FP: {{ alert.false_positive_risk }}</span>
-      {% if not alert.acknowledged %}
-      <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
-              onclick="ackAlert({{ alert.id }}, this)">Acknowledge</button>
-      <button class="btn secondary" style="font-size:.7rem;padding:.2rem .5rem;"
-              title="Acknowledge AND silence future matching events from the affected hosts"
-              onclick="ignoreWarning(this, {{ alert.id }})">Ack+Ignore</button>
-      {% else %}
-      <span class="text-muted" style="font-size:.75rem;">✓ Acknowledged</span>
-      {% endif %}
-    </div>
-    <div class="alert-meta">
-      First: {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} UTC
-      {% if alert.last_seen and alert.seen_count and alert.seen_count > 1 %}
-      · Last: {{ alert.last_seen.strftime('%H:%M:%S') }}
-      {% endif %}
-      · {{ alert.event_count }} events analysed
-      {% if alert.affected_hosts %}· Hosts: {{ alert.affected_hosts | join(', ') }}{% endif %}
-    </div>
-    <div class="alert-desc">{{ alert.description }}</div>
-    {% if alert.recommended_action %}
-    <div class="alert-action">→ <strong>Action:</strong> {{ alert.recommended_action }}</div>
-    {% endif %}
-    <div style="margin-top:.5rem;">
-      <button class="btn ghost" style="font-size:.7rem;padding:.2rem .5rem;" onclick="toggleDetail(this)">Show more</button>
-    </div>
-    <div class="alert-raw" style="display:none;margin-top:.5rem;">
-      <div style="font-size:.75rem;color:var(--fg-muted,#999);margin-bottom:.3rem;"><strong>LLM raw analysis</strong></div>
-      <pre style="white-space:pre-wrap;word-break:break-word;font-size:.72rem;background:var(--bg-inset,#1a1a2e);padding:.6rem;border-radius:6px;max-height:400px;overflow-y:auto;">{{ alert.raw_result | tojson(indent=2) if alert.raw_result else '(no raw data)' }}</pre>
-    </div>
-  </div>
-  {% endfor %}
-
-  {% set pages = (total // limit) + (1 if total % limit else 0) %}
-  {% if pages > 1 %}
-  <div class="pagination">
-    {% if page > 1 %}<a href="?page={{ page-1 }}">‹ Prev</a>{% endif %}
-    {% for p in range(1, pages+1) %}
-      {% if p == page %}<span class="current">{{ p }}</span>
-      {% else %}<a href="?page={{ p }}">{{ p }}</a>{% endif %}
-    {% endfor %}
-    {% if page < pages %}<a href="?page={{ page+1 }}">Next ›</a>{% endif %}
-  </div>
-  {% endif %}
-
-{% else %}
-  <div class="empty-state card">No alerts yet — the LLM has found nothing suspicious.</div>
-{% endif %}
-
-<script>
-function toggleDetail(btn) {
-  var d = btn.parentElement.nextElementSibling;
-  if (d.style.display === 'none') { d.style.display = 'block'; btn.textContent = 'Show less'; }
-  else { d.style.display = 'none'; btn.textContent = 'Show more'; }
 }
 </script>
 {% endblock %}
