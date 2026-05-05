@@ -11,6 +11,7 @@
     <a href="/" class="nav-brand">LogLM</a>
     <div class="nav-links">
       <a href="/">Dashboard</a>
+      <a href="/opscenter" class="nav-opscenter">OpsCenter</a>
       <a href="/logs">Logs</a>
       <a href="/alerts">Alerts</a>
       <a href="/metrics">Metrics</a>
@@ -21,8 +22,15 @@
       <a href="/retention">Retention</a>
       <a href="/settings">Settings</a>
       <a href="/chat">Chat</a>
+      <a href="/hitl" class="nav-hitl" id="nav-hitl" title="Human-in-the-Loop approval queue">
+        HITL<span id="nav-hitl-badge" style="display:none;" class="nav-badge">0</span>
+      </a>
+      <a href="/users" class="nav-admin" id="nav-users">Users</a>
+      <a href="/audit" class="nav-admin" id="nav-audit">Audit</a>
     </div>
-    <div id="live-indicator" class="live-dot disconnected" title="Live stream status"></div>
+    <div style="display:flex;align-items:center;gap:.6rem;margin-left:auto;">
+      <div id="live-indicator" class="live-dot disconnected" title="Live stream status"></div>
+    </div>
   </nav>
 
   <main>
@@ -31,5 +39,48 @@
 
   <script src="/static/js/app.js"></script>
   {% block scripts %}{% endblock %}
+  <script>
+  // Highlight active nav link
+  (function() {
+    const path = window.location.pathname;
+    document.querySelectorAll('.nav-links a').forEach(a => {
+      const href = a.getAttribute('href');
+      if (href && path === href || (href !== '/' && path.startsWith(href))) {
+        a.classList.add('active');
+      }
+    });
+  })();
+
+  // HITL pending badge - poll every 30s
+  async function updateHitlBadge() {
+    try {
+      const r = await fetch('/api/hitl/pending-count');
+      if (!r.ok) return;
+      const d = await r.json();
+      const badge = document.getElementById('nav-hitl-badge');
+      if (!badge) return;
+      if (d.count > 0) {
+        badge.textContent = d.count;
+        badge.style.display = 'inline-block';
+      } else {
+        badge.style.display = 'none';
+      }
+    } catch {}
+  }
+  updateHitlBadge();
+  setInterval(updateHitlBadge, 30000);
+  </script>
+  <style>
+  .nav-opscenter { color: var(--accent) !important; font-weight: 600 !important; }
+  .nav-hitl      { position: relative; }
+  .nav-admin     { color: var(--text-muted); opacity: .7; font-size: .8rem; }
+  .nav-badge {
+    position: absolute; top: -6px; right: -10px;
+    background: var(--err); color: #fff; font-size: .6rem; font-weight: 700;
+    min-width: 16px; height: 16px; border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0 3px; line-height: 1;
+  }
+  </style>
 </body>
 </html>

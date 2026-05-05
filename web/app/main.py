@@ -31,6 +31,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from app import auth, observability
+import opscenter as ops
+import hitl as hitl_mod
 
 try:
     import docker as docker_sdk
@@ -319,8 +321,111 @@ async def startup():
     app.state.redis = _redis
     app.state.http = _http
 
+    # ── OpsCenter schema (idempotent, runs after main schema) ────────────────
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            -- Extend users for RBAC + profile
+            ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+            ALTER TABLE users ADD CONSTRAINT users_role_check
+                CHECK (role IN ('admin', 'operator', 'viewer'));
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email        TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by   TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INT NOT NULL DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+
+            -- Immutable audit chain
+            CREATE TABLE IF NOT EXISTS audit_chain (
+                id           BIGSERIAL PRIMARY KEY,
+                timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                actor        TEXT NOT NULL,
+                actor_method TEXT NOT NULL DEFAULT 'system',
+                action       TEXT NOT NULL,
+                target       TEXT,
+                detail       JSONB DEFAULT '{}',
+                ip           INET,
+                severity     TEXT NOT NULL DEFAULT 'info',
+                prev_hash    TEXT NOT NULL,
+                entry_hash   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_chain_ts     ON audit_chain (timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_chain_actor  ON audit_chain (actor, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_chain_action ON audit_chain (action);
+
+            -- HITL pending actions
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at       TIMESTAMPTZ,
+                requested_by     TEXT NOT NULL,
+                session_id       TEXT,
+                action_type      TEXT NOT NULL,
+                action_title     TEXT NOT NULL,
+                action_desc      TEXT NOT NULL DEFAULT '',
+                payload          JSONB NOT NULL DEFAULT '{}',
+                risk_level       TEXT NOT NULL DEFAULT 'medium',
+                status           TEXT NOT NULL DEFAULT 'pending',
+                reviewed_by      TEXT,
+                reviewed_at      TIMESTAMPTZ,
+                executed_at      TIMESTAMPTZ,
+                execution_result JSONB,
+                rejection_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_actions_status
+                ON pending_actions (status) WHERE status = 'pending';
+            CREATE INDEX IF NOT EXISTS idx_pending_actions_created
+                ON pending_actions (created_at DESC);
+
+            -- Activity feed
+            CREATE TABLE IF NOT EXISTS activity_feed (
+                id          BIGSERIAL PRIMARY KEY,
+                timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                actor       TEXT NOT NULL DEFAULT 'system',
+                action_type TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                detail      TEXT,
+                severity    TEXT NOT NULL DEFAULT 'info',
+                source      TEXT NOT NULL DEFAULT 'system',
+                link        TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_feed_ts ON activity_feed (timestamp DESC);
+
+            -- Monitoring silences
+            CREATE TABLE IF NOT EXISTS monitoring_silences (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                host             TEXT,
+                category         TEXT,
+                severity_filter  TEXT,
+                reason           TEXT NOT NULL DEFAULT '',
+                created_by       TEXT NOT NULL,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at       TIMESTAMPTZ NOT NULL,
+                revoked_at       TIMESTAMPTZ,
+                revoked_by       TEXT,
+                action_id        UUID
+            );
+            CREATE INDEX IF NOT EXISTS idx_silences_expires
+                ON monitoring_silences (expires_at) WHERE revoked_at IS NULL;
+        """)
+
     observability.install(app, OLLAMA_URL, LOKI_URL)
     await auth.bootstrap_admin(_pool)
+
+    # Bootstrap default admin/changeme if no users exist and no bootstrap env var set
+    try:
+        async with _pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        if count == 0:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO users (username, password_hash, role, display_name) "
+                    "VALUES ($1, $2, 'admin', 'Administrator') ON CONFLICT DO NOTHING",
+                    "admin", auth.hash_password("changeme"),
+                )
+            print("[web] OpsCenter: bootstrapped default admin/changeme — "
+                  "CHANGE THIS PASSWORD IMMEDIATELY via /users")
+    except Exception as _be:
+        print(f"[web] OpsCenter bootstrap check failed: {_be}")
 
     # Restore persisted ignored alert cooldown_keys into Redis on every startup.
     # This prevents ignored alert rules from silently evaporating on container restart.
@@ -380,6 +485,23 @@ async def shutdown():
         await _redis.aclose()
     if _http:
         await _http.aclose()
+
+
+# ── Background task: HITL expiry sweep (every 5 minutes) ─────────────────────
+
+async def _hitl_expiry_loop():
+    while True:
+        await asyncio.sleep(300)
+        if _pool:
+            try:
+                await hitl_mod.expire_stale_actions(_pool)
+            except Exception as e:
+                print(f"[hitl] expiry loop error: {e}")
+
+
+@app.on_event("startup")
+async def _start_background_tasks():
+    asyncio.create_task(_hitl_expiry_loop())
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -919,7 +1041,7 @@ async def api_alert_verdict(alert_id: int, req: AlertVerdictRequest):
             try:
                 await _redis.sadd("loglm:ignored_alert_keys", cooldown_key)
             except Exception as e:
-                log.warning(f"ignored_alert_keys sadd failed: {e}")
+                print(f"[web] ignored_alert_keys sadd failed: {e}")
         # Also inject the event-level feedback row so Tier 1 learns too
         try:
             hosts = list(row.get("affected_hosts") or []) or [""]
@@ -934,7 +1056,7 @@ async def api_alert_verdict(alert_id: int, req: AlertVerdictRequest):
                         h, pattern or "*",
                     )
         except Exception as e:
-            log.debug(f"alert verdict → event_feedback insert failed: {e}")
+            print(f"[web] alert verdict event_feedback insert failed: {e}")
 
     elif req.verdict == "restore":
         # Remove from Redis suppression set — analyzer will stop suppressing
@@ -942,7 +1064,7 @@ async def api_alert_verdict(alert_id: int, req: AlertVerdictRequest):
             try:
                 await _redis.srem("loglm:ignored_alert_keys", cooldown_key)
             except Exception as e:
-                log.warning(f"ignored_alert_keys srem failed: {e}")
+                print(f"[web] ignored_alert_keys srem failed: {e}")
 
     # Notify processor + analyzer to refresh their feedback caches
     try:
@@ -3675,3 +3797,576 @@ async def config_import(req: ConfigImport):
             counts["topology_nodes"] = len(cfg["topology_nodes"])
 
     return JSONResponse({"imported": counts})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  OPSCENTER — Dashboard, User Management, HITL, Audit Chain
+# ═════════════════════════════════════════════════════════════════════════════
+
+import dataclasses as _dc
+
+def _health_to_dict(h) -> dict:
+    return {
+        **_dc.asdict(h),
+        "components": [_dc.asdict(c) for c in h.components],
+    }
+
+
+# ── OpsCenter dashboard ───────────────────────────────────────────────────────
+
+@app.get("/opscenter", response_class=HTMLResponse)
+async def opscenter_page(request: Request):
+    health = await ops.get_system_health(_pool, _redis, _http)
+    silences = await ops.get_active_silences(_pool)
+    activity = await ops.get_activity_feed(_pool, limit=40)
+    pending_hitl = 0
+    try:
+        async with _pool.acquire() as conn:
+            pending_hitl = await conn.fetchval(
+                "SELECT COUNT(*) FROM pending_actions WHERE status='pending'"
+            )
+    except Exception:
+        pass
+    return templates.TemplateResponse("opscenter.html", {
+        "request":      request,
+        "health":       health,
+        "silences":     silences,
+        "activity":     activity,
+        "pending_hitl": pending_hitl,
+    })
+
+
+@app.get("/api/opscenter/health")
+async def api_opscenter_health():
+    health = await ops.get_system_health(_pool, _redis, _http)
+    return JSONResponse(_health_to_dict(health))
+
+
+@app.get("/api/opscenter/activity")
+async def api_opscenter_activity(limit: int = Query(default=60, le=200)):
+    feed = await ops.get_activity_feed(_pool, limit=limit)
+    return JSONResponse([
+        {**row, "timestamp": row["timestamp"].isoformat() if hasattr(row.get("timestamp"), "isoformat") else str(row.get("timestamp", ""))}
+        for row in feed
+    ])
+
+
+@app.get("/api/opscenter/activity/stream")
+async def api_opscenter_activity_stream(request: Request):
+    """SSE stream for real-time activity feed updates."""
+    async def _gen():
+        pubsub = _redis.pubsub()
+        await pubsub.subscribe("loglm:activity")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    yield f"data: {msg['data']}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+        finally:
+            await pubsub.unsubscribe("loglm:activity")
+            await pubsub.aclose()
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+# ── Monitoring silences ───────────────────────────────────────────────────────
+
+class SilenceRequest(BaseModel):
+    host:             str | None = None
+    category:         str | None = None
+    severity_filter:  str | None = None
+    reason:           str
+    duration_minutes: int = 60
+
+
+@app.get("/api/silences")
+async def api_silences_list():
+    silences = await ops.get_active_silences(_pool)
+    return JSONResponse(jsonable_encoder(silences))
+
+
+@app.post("/api/silences")
+async def api_silences_create(req: SilenceRequest, request: Request):
+    principal = request.state.user
+    if principal.role not in (ops.ROLE_ADMIN, ops.ROLE_OPERATOR):
+        raise HTTPException(403, "operator or admin role required")
+    if not req.host and not req.category and not req.severity_filter:
+        raise HTTPException(400, "at least one scope (host/category/severity_filter) required")
+    sid = await ops.create_silence(
+        _pool, _redis,
+        host=req.host, category=req.category, severity_filter=req.severity_filter,
+        reason=req.reason[:500], created_by=principal.username,
+        duration_minutes=min(req.duration_minutes, 1440),
+    )
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="CREATE_SILENCE",
+        target=f"silence:{sid}",
+        detail={"host": req.host, "category": req.category,
+                "severity_filter": req.severity_filter,
+                "duration_minutes": req.duration_minutes, "reason": req.reason},
+        ip=auth._client_ip(request), severity="warning",
+    )
+    await ops.push_activity(
+        _pool, _redis,
+        actor=principal.username, action_type="silence_created",
+        title=f"Monitoring silence created by {principal.username}",
+        detail=f"scope: host={req.host} cat={req.category} sev={req.severity_filter} "
+               f"for {req.duration_minutes}m — {req.reason}",
+        severity="warning", source="user",
+    )
+    return JSONResponse({"ok": True, "silence_id": sid})
+
+
+@app.delete("/api/silences/{silence_id}")
+async def api_silences_revoke(silence_id: str, request: Request):
+    principal = request.state.user
+    if principal.role not in (ops.ROLE_ADMIN, ops.ROLE_OPERATOR):
+        raise HTTPException(403, "operator or admin role required")
+    ok = await ops.revoke_silence(_pool, _redis, silence_id, principal.username)
+    if not ok:
+        raise HTTPException(404, "silence not found or already expired")
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="REVOKE_SILENCE", target=f"silence:{silence_id}",
+        detail={}, ip=auth._client_ip(request), severity="info",
+    )
+    return JSONResponse({"ok": True})
+
+
+# ── User management ───────────────────────────────────────────────────────────
+
+@app.get("/users", response_class=HTMLResponse)
+async def users_page(request: Request):
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    users = await ops.list_users(_pool)
+    return templates.TemplateResponse("users.html", {
+        "request": request,
+        "users":   users,
+        "roles":   ops.VALID_ROLES,
+    })
+
+
+class CreateUserRequest(BaseModel):
+    username:     str
+    password:     str
+    role:         str = ops.ROLE_VIEWER
+    display_name: str | None = None
+    email:        str | None = None
+
+
+class UpdateUserRequest(BaseModel):
+    role:         str | None = None
+    display_name: str | None = None
+    email:        str | None = None
+    disabled:     bool | None = None
+    new_password: str | None = None
+
+
+@app.get("/api/users")
+async def api_users_list(request: Request):
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    return JSONResponse(jsonable_encoder(await ops.list_users(_pool)))
+
+
+@app.post("/api/users")
+async def api_users_create(req: CreateUserRequest, request: Request):
+    principal = request.state.user
+    if principal.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    if req.role not in ops.VALID_ROLES:
+        raise HTTPException(400, f"role must be one of {ops.VALID_ROLES}")
+    if len(req.password) < 8:
+        raise HTTPException(400, "password must be at least 8 characters")
+    if not req.username or len(req.username) > 60:
+        raise HTTPException(400, "username must be 1-60 characters")
+    try:
+        async with _pool.acquire() as conn:
+            uid = await conn.fetchval(
+                """INSERT INTO users (username, password_hash, role, display_name, email, created_by)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING id""",
+                req.username.strip(),
+                auth.hash_password(req.password),
+                req.role,
+                req.display_name,
+                req.email,
+                principal.username,
+            )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(409, "username already exists")
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="CREATE_USER", target=f"user:{req.username}",
+        detail={"role": req.role, "display_name": req.display_name},
+        ip=auth._client_ip(request), severity="warning",
+    )
+    await ops.push_activity(
+        _pool, _redis, actor=principal.username, action_type="user_created",
+        title=f"User '{req.username}' created (role: {req.role})",
+        severity="warning", source="user", link="/users",
+    )
+    return JSONResponse({"ok": True, "user_id": uid, "username": req.username})
+
+
+@app.put("/api/users/{user_id}")
+async def api_users_update(user_id: int, req: UpdateUserRequest, request: Request):
+    principal = request.state.user
+    if principal.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    if req.role and req.role not in ops.VALID_ROLES:
+        raise HTTPException(400, f"role must be one of {ops.VALID_ROLES}")
+    if req.new_password and len(req.new_password) < 8:
+        raise HTTPException(400, "password must be at least 8 characters")
+
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, username, role FROM users WHERE id=$1", user_id)
+        if not row:
+            raise HTTPException(404, "user not found")
+        # Prevent self-demotion of the only admin
+        if req.role and req.role != ops.ROLE_ADMIN and row["role"] == ops.ROLE_ADMIN:
+            admin_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND NOT disabled"
+            )
+            if admin_count <= 1:
+                raise HTTPException(409, "Cannot demote the only active admin")
+
+        changes: dict = {}
+        if req.role is not None:        changes["role"]         = req.role
+        if req.display_name is not None: changes["display_name"] = req.display_name
+        if req.email is not None:       changes["email"]        = req.email
+        if req.disabled is not None:    changes["disabled"]     = req.disabled
+        if req.new_password:
+            changes["password_hash"] = auth.hash_password(req.new_password)
+
+        if not changes:
+            return JSONResponse({"ok": True, "changed": 0})
+
+        sets = ", ".join(f"{k}=${i+2}" for i, k in enumerate(changes))
+        await conn.execute(
+            f"UPDATE users SET {sets}, updated_at=NOW() WHERE id=$1",
+            user_id, *changes.values(),
+        )
+
+    detail_safe = {k: v for k, v in changes.items() if k != "password_hash"}
+    if req.new_password:
+        detail_safe["password_changed"] = True
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="UPDATE_USER", target=f"user:{row['username']}",
+        detail=detail_safe, ip=auth._client_ip(request), severity="warning",
+    )
+    await ops.push_activity(
+        _pool, _redis, actor=principal.username, action_type="user_updated",
+        title=f"User '{row['username']}' updated: {', '.join(detail_safe.keys())}",
+        severity="info", source="user", link="/users",
+    )
+    return JSONResponse({"ok": True, "changed": len(changes)})
+
+
+@app.delete("/api/users/{user_id}")
+async def api_users_delete(user_id: int, request: Request):
+    principal = request.state.user
+    if principal.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, username, role FROM users WHERE id=$1", user_id)
+        if not row:
+            raise HTTPException(404, "user not found")
+        if row["id"] == principal.user_id:
+            raise HTTPException(409, "Cannot delete your own account")
+        if row["role"] == ops.ROLE_ADMIN:
+            admin_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND NOT disabled"
+            )
+            if admin_count <= 1:
+                raise HTTPException(409, "Cannot delete the only active admin")
+        await conn.execute("DELETE FROM users WHERE id=$1", user_id)
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="DELETE_USER", target=f"user:{row['username']}",
+        detail={"role": row["role"]}, ip=auth._client_ip(request), severity="critical",
+    )
+    await ops.push_activity(
+        _pool, _redis, actor=principal.username, action_type="user_deleted",
+        title=f"User '{row['username']}' deleted",
+        severity="warning", source="user", link="/users",
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/users/{user_id}/sessions")
+async def api_user_sessions(user_id: int, request: Request):
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    sessions = await ops.get_user_sessions(_pool, user_id)
+    return JSONResponse(jsonable_encoder(sessions))
+
+
+@app.post("/api/users/{user_id}/revoke-sessions")
+async def api_user_revoke_sessions(user_id: int, request: Request):
+    principal = request.state.user
+    if principal.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    n = await ops.revoke_user_sessions(_pool, user_id)
+    await hitl_mod.audit_write(
+        _pool, actor=principal.username, actor_method="session",
+        action="REVOKE_USER_SESSIONS", target=f"user_id:{user_id}",
+        detail={"revoked": n}, ip=auth._client_ip(request), severity="warning",
+    )
+    return JSONResponse({"ok": True, "revoked": n})
+
+
+# ── HITL pending actions ──────────────────────────────────────────────────────
+
+@app.get("/hitl", response_class=HTMLResponse)
+async def hitl_page(request: Request):
+    if request.state.user.role not in (ops.ROLE_ADMIN, ops.ROLE_OPERATOR):
+        raise HTTPException(403, "operator or admin role required")
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM pending_actions ORDER BY created_at DESC LIMIT 100"
+        )
+    return templates.TemplateResponse("hitl.html", {
+        "request": request,
+        "actions": [dict(r) for r in rows],
+        "can_approve": request.state.user.role == ops.ROLE_ADMIN,
+    })
+
+
+class ProposeActionRequest(BaseModel):
+    action_type:  str
+    action_title: str
+    action_desc:  str
+    payload:      dict
+    risk_level:   str = hitl_mod.RISK_MEDIUM
+
+
+@app.post("/api/hitl/propose")
+async def api_hitl_propose(req: ProposeActionRequest, request: Request):
+    principal = request.state.user
+    if principal.role not in ops.HITL_PROPOSERS:
+        raise HTTPException(403, "operator or admin role required to propose actions")
+    action_id = await hitl_mod.propose_action(
+        _pool,
+        requested_by=principal.username,
+        action_type=req.action_type,
+        action_title=req.action_title[:200],
+        action_desc=req.action_desc[:1000],
+        payload=req.payload,
+        risk_level=req.risk_level,
+        ip=auth._client_ip(request),
+    )
+    await ops.push_activity(
+        _pool, _redis,
+        actor=principal.username, action_type="hitl_proposed",
+        title=f"Action proposed: {req.action_title}",
+        detail=f"risk={req.risk_level} type={req.action_type}",
+        severity="warning" if req.risk_level in ("high", "critical") else "info",
+        source="user", link="/hitl",
+    )
+    # Publish to Redis so HITL page updates in real-time
+    try:
+        await _redis.publish("loglm:hitl", json.dumps({
+            "event": "proposed", "action_id": action_id,
+            "title": req.action_title, "risk_level": req.risk_level,
+        }))
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "action_id": action_id,
+                         "message": "Action queued for admin approval"})
+
+
+@app.post("/api/hitl/{action_id}/approve")
+async def api_hitl_approve(action_id: str, request: Request):
+    principal = request.state.user
+    try:
+        result = await hitl_mod.approve_action(
+            _pool, _redis, action_id,
+            approved_by=principal.username,
+            approved_by_role=principal.role,
+            ip=auth._client_ip(request),
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    await ops.push_activity(
+        _pool, _redis,
+        actor=principal.username, action_type="hitl_approved",
+        title=f"HITL action approved by {principal.username}",
+        detail=f"action_id={action_id} result={'ok' if result.get('ok') else 'failed'}",
+        severity="warning", source="user", link="/hitl",
+    )
+    try:
+        await _redis.publish("loglm:hitl", json.dumps({
+            "event": "approved", "action_id": action_id,
+            "approved_by": principal.username,
+        }))
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "action_id": action_id, "result": result})
+
+
+class RejectRequest(BaseModel):
+    reason: str | None = None
+
+
+@app.post("/api/hitl/{action_id}/reject")
+async def api_hitl_reject(action_id: str, req: RejectRequest, request: Request):
+    principal = request.state.user
+    try:
+        await hitl_mod.reject_action(
+            _pool, action_id,
+            rejected_by=principal.username,
+            rejected_by_role=principal.role,
+            reason=req.reason,
+            ip=auth._client_ip(request),
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    await ops.push_activity(
+        _pool, _redis,
+        actor=principal.username, action_type="hitl_rejected",
+        title=f"HITL action rejected by {principal.username}",
+        detail=req.reason or "No reason given",
+        severity="info", source="user", link="/hitl",
+    )
+    try:
+        await _redis.publish("loglm:hitl", json.dumps({
+            "event": "rejected", "action_id": action_id,
+            "rejected_by": principal.username,
+        }))
+    except Exception:
+        pass
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/hitl")
+async def api_hitl_list(
+    status: str | None = Query(default=None),
+    limit:  int = Query(default=100, le=500),
+):
+    """Return pending_actions filtered by status for the HITL management page."""
+    async with _pool.acquire() as conn:
+        if status:
+            rows = await conn.fetch(
+                "SELECT * FROM pending_actions WHERE status=$1 ORDER BY created_at DESC LIMIT $2",
+                status, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM pending_actions ORDER BY created_at DESC LIMIT $1", limit
+            )
+    return JSONResponse({"actions": jsonable_encoder([dict(r) for r in rows])})
+
+
+@app.get("/api/hitl/pending-count")
+async def api_hitl_pending_count():
+    async with _pool.acquire() as conn:
+        n = await conn.fetchval(
+            "SELECT COUNT(*) FROM pending_actions WHERE status='pending'"
+        )
+    return JSONResponse({"count": n})
+
+
+@app.get("/api/hitl/stream")
+async def api_hitl_stream(request: Request):
+    """SSE stream: broadcasts approve/reject/propose events to subscribers."""
+    async def _gen():
+        pubsub = _redis.pubsub()
+        await pubsub.subscribe("loglm:hitl")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    yield f"data: {msg['data']}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+        finally:
+            await pubsub.unsubscribe("loglm:hitl")
+            await pubsub.aclose()
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+# ── Immutable audit chain ─────────────────────────────────────────────────────
+
+@app.get("/audit", response_class=HTMLResponse)
+async def audit_log_page(request: Request):
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, timestamp, actor, actor_method, action, target, "
+            "       severity, prev_hash, entry_hash "
+            "FROM audit_chain ORDER BY timestamp DESC LIMIT 200"
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM audit_chain")
+    return templates.TemplateResponse("audit_log.html", {
+        "request": request,
+        "entries": [dict(r) for r in rows],
+        "total":   total,
+    })
+
+
+@app.get("/api/audit")
+async def api_audit_list(
+    request: Request,
+    limit:  int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+    actor:  str | None = None,
+    action: str | None = None,
+):
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    filters = ["1=1"]
+    params: list = []
+    idx = 1
+    if actor:
+        filters.append(f"actor = ${idx}"); params.append(actor); idx += 1
+    if action:
+        filters.append(f"action ILIKE ${idx}"); params.append(f"%{action}%"); idx += 1
+    where = " AND ".join(filters)
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id, timestamp, actor, actor_method, action, target, "
+            f"severity, ip::TEXT, detail, prev_hash, entry_hash "
+            f"FROM audit_chain WHERE {where} "
+            f"ORDER BY timestamp DESC LIMIT ${idx} OFFSET ${idx+1}",
+            *params, limit, offset,
+        )
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM audit_chain WHERE {where}", *params)
+    return JSONResponse({
+        "total":   total,
+        "entries": jsonable_encoder([dict(r) for r in rows]),
+    })
+
+
+@app.get("/api/audit/verify")
+async def api_audit_verify(request: Request):
+    """Re-compute the entire hash chain. Reports first broken link if any."""
+    if request.state.user.role != ops.ROLE_ADMIN:
+        raise HTTPException(403, "admin role required")
+    result = await hitl_mod.audit_verify(_pool)
+    return JSONResponse(result)
+
+
+# ── LLM chat extended with HITL proposal detection ───────────────────────────
+# Extends the existing chat endpoint to detect HITL action proposals in responses
+# and automatically enqueue them for admin approval. The response visible to the
+# user has the raw ```hitl_action``` block stripped and replaced with a proposal
+# card that links to /hitl.
+
+@app.get("/api/hitl/chat-system-addendum")
+async def api_hitl_chat_system():
+    """Return the HITL system prompt addendum injected into every chat call."""
+    return JSONResponse({"system": hitl_mod.HITL_DETECTION_SYSTEM})

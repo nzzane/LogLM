@@ -733,6 +733,120 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- OpsCenter extensions
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- Extend users table for enterprise RBAC (operator role + profile fields)
+DO $$ BEGIN
+    BEGIN
+        ALTER TABLE users ADD COLUMN display_name TEXT;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE users ADD COLUMN email TEXT;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE users ADD COLUMN created_by TEXT;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE users ADD COLUMN failed_login_attempts INT NOT NULL DEFAULT 0;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE users ADD COLUMN locked_until TIMESTAMPTZ;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+END $$;
+
+-- Widen the role CHECK to include 'operator'
+-- (PostgreSQL cannot ALTER CHECK constraints; drop + re-add)
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+ALTER TABLE users ADD CONSTRAINT users_role_check
+    CHECK (role IN ('admin', 'operator', 'viewer'));
+
+-- Immutable hash-chained audit log.
+-- Each row stores SHA-256(id||timestamp||actor||action||detail||prev_hash).
+-- Any modification of an existing row breaks the chain; verifiable via
+-- GET /api/audit/verify (re-computes every hash from genesis).
+CREATE TABLE IF NOT EXISTS audit_chain (
+    id           BIGSERIAL PRIMARY KEY,
+    timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor        TEXT NOT NULL,          -- username / 'system' / 'llm'
+    actor_method TEXT NOT NULL,          -- session | apikey | llm_hitl | system
+    action       TEXT NOT NULL,          -- LOGIN | CREATE_USER | HITL_APPROVE | ...
+    target       TEXT,
+    detail       JSONB DEFAULT '{}',
+    ip           INET,
+    severity     TEXT NOT NULL DEFAULT 'info',   -- info | warning | critical
+    prev_hash    TEXT NOT NULL,          -- SHA-256 of previous row (genesis = '000...')
+    entry_hash   TEXT NOT NULL           -- SHA-256 of this row's content
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_ts     ON audit_chain (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_actor  ON audit_chain (actor, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_action ON audit_chain (action);
+
+-- HITL pending-action queue.
+-- Actions proposed by the LLM (or operator) sit here until an admin approves
+-- or rejects them. No state-changing execution happens without explicit approval.
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at       TIMESTAMPTZ,
+    requested_by     TEXT NOT NULL,       -- username or 'llm'
+    session_id       TEXT,
+    action_type      TEXT NOT NULL,
+    action_title     TEXT NOT NULL,
+    action_desc      TEXT NOT NULL DEFAULT '',
+    payload          JSONB NOT NULL DEFAULT '{}',
+    risk_level       TEXT NOT NULL DEFAULT 'medium',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    reviewed_by      TEXT,
+    reviewed_at      TIMESTAMPTZ,
+    executed_at      TIMESTAMPTZ,
+    execution_result JSONB,
+    rejection_reason TEXT,
+    CHECK (status IN ('pending','approved','rejected','expired','executed')),
+    CHECK (risk_level IN ('low','medium','high','critical'))
+);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_status  ON pending_actions (status) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_pending_actions_created ON pending_actions (created_at DESC);
+
+-- Real-time activity feed (rolling window; NOT immutable — use audit_chain for governance).
+-- Sourced from alerts, HITL events, user actions, LLM proposals.
+CREATE TABLE IF NOT EXISTS activity_feed (
+    id          BIGSERIAL PRIMARY KEY,
+    timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor       TEXT NOT NULL DEFAULT 'system',
+    action_type TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    detail      TEXT,
+    severity    TEXT NOT NULL DEFAULT 'info',
+    source      TEXT NOT NULL DEFAULT 'system',  -- llm | user | system | monitor
+    link        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_activity_feed_ts ON activity_feed (timestamp DESC);
+
+-- Monitoring silences: host/category/severity-scoped pauses on alert generation.
+-- Created via HITL approval or manually by admin/operator.
+-- Revocation sets revoked_at; expired silences auto-excluded by expires_at check.
+CREATE TABLE IF NOT EXISTS monitoring_silences (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    host             TEXT,               -- NULL = all hosts
+    category         TEXT,               -- NULL = all categories
+    severity_filter  TEXT,               -- NULL = all severities
+    reason           TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at       TIMESTAMPTZ NOT NULL,
+    revoked_at       TIMESTAMPTZ,
+    revoked_by       TEXT,
+    action_id        UUID REFERENCES pending_actions(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_silences_expires ON monitoring_silences (expires_at) WHERE revoked_at IS NULL;
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- Runtime-editable settings (Three-tier LLM configuration, Ollama URLs, etc.)
 -- Created here so all services can rely on this table existing at DB init,
 -- regardless of which service starts first.
