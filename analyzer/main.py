@@ -1,11 +1,14 @@
 """
 Analyzer service.
 
-Two concurrent loops:
-  1. Alert analysis — drains loglm:analysis queue, asks LLM if anomalous
+Three concurrent loops:
+  1. Alert analysis  — drains loglm:analysis queue, asks LLM if anomalous
   2. Memory summariser — every MEMORY_INTERVAL, builds a compressed summary of
      recent events + SNMP metrics and stores it in memory_summaries table.
      These summaries are used by the chat system as long-term memory.
+  3. Tier 3 forensic engine — drains loglm:forensics queue, performs deep
+     causal chain analysis on escalated critical alerts, produces Pre-Alert
+     reports stored in pre_alert_reports table.
 """
 
 import asyncio
@@ -23,9 +26,35 @@ import redis.asyncio as aioredis
 
 import metrics as analyzer_metrics
 import streams
+import tier3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [analyzer] %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+# Per-category Tier 3 escalation cooldown (process-local, same pattern as
+# firewall_llm_recently_seen in processor). Prevents a noisy model from
+# saturating the forensics queue with repeated escalations for the same issue.
+# Default: one T3 investigation per category per ALERT_COOLDOWN window.
+_t3_escalation_cache: dict[str, float] = {}
+_T3_ESCALATION_COOLDOWN = int(os.environ.get("T3_ESCALATION_COOLDOWN", "600"))  # 10 min
+
+
+def _t3_recently_escalated(result: dict) -> bool:
+    """Return True if this category was already escalated to T3 within the cooldown."""
+    category = result.get("category") or "unknown"
+    hosts = ",".join(sorted(result.get("affected_hosts") or []))
+    key = f"{category}:{hosts}"
+    now = time.monotonic()
+    last = _t3_escalation_cache.get(key)
+    if last is not None and now - last < _T3_ESCALATION_COOLDOWN:
+        return True
+    _t3_escalation_cache[key] = now
+    # Prune stale entries every time we record a new one
+    cutoff = now - _T3_ESCALATION_COOLDOWN
+    stale = [k for k, v in _t3_escalation_cache.items() if v < cutoff]
+    for k in stale:
+        del _t3_escalation_cache[k]
+    return False
 
 REDIS_URL = os.environ["REDIS_URL"]
 POSTGRES_DSN = os.environ["POSTGRES_DSN"]
@@ -398,9 +427,11 @@ def _categories_match(a: str, b: str) -> bool:
     return overlap / min(len(words_a), len(words_b)) >= 0.6
 
 
-async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -> tuple[bool, int]:
+async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -> tuple[bool, int, int | None]:
     """Fuzzy dedup: exact cooldown_key first, then category+host overlap match.
-    On match, merges affected_hosts and bumps seen_count."""
+    On match, merges affected_hosts and bumps seen_count.
+    Returns (was_new, seen_count, alert_id).
+    alert_id is None when the alert was deduped into an existing record."""
     key = _cooldown_key(result)
     category = result.get("category") or _normalize_category(result.get("title", ""))
     new_hosts = set(result.get("affected_hosts", []))
@@ -420,7 +451,7 @@ async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -
                 "UPDATE alerts SET seen_count=$1, last_seen=NOW(), event_count=event_count+$2 WHERE id=$3",
                 new_count, event_count, existing["id"],
             )
-            return False, new_count
+            return False, new_count, None
 
         candidates = await conn.fetch(
             """SELECT id, seen_count, affected_hosts, title, cooldown_key
@@ -447,14 +478,17 @@ async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -
                 )
                 log.info(f"Fuzzy dedup: merged into alert {cand['id']} "
                          f"(hosts {merged}, seen {new_count}×)")
-                return False, new_count
+                return False, new_count, None
 
-        await conn.execute(
+        # Use RETURNING to get the exact ID of the row we just inserted,
+        # avoiding a racy SELECT after INSERT.
+        row = await conn.fetchrow(
             """INSERT INTO alerts
                    (timestamp, severity, title, description, affected_hosts,
                     recommended_action, false_positive_risk, event_count,
                     raw_result, cooldown_key, seen_count, last_seen)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,1,$1)""",
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,1,$1)
+               RETURNING id""",
             datetime.now(timezone.utc),
             sev,
             result.get("title", "Unknown"),
@@ -466,7 +500,7 @@ async def _dedup_or_insert(pool: asyncpg.Pool, result: dict, event_count: int) -
             json.dumps(result),
             key,
         )
-        return True, 1
+        return True, 1, row["id"] if row else None
 
 
 SEVERITY_COLORS = {"critical": 0xFF0000, "high": 0xFF6600, "medium": 0xFFAA00, "low": 0x00AAFF}
@@ -637,11 +671,16 @@ async def analyze_loop(redis_client, pool: asyncpg.Pool, http_client: httpx.Asyn
             log.info(f"ALERT [{sev}] [{stream_name}]: {result.get('title','?')}")
             analyzer_metrics.alerts_emitted.labels(sev).inc()
             analyzer_metrics.batches_total.labels("ok").inc()
-            was_new, seen = await _dedup_or_insert(pool, result, len(events))
+            was_new, seen, alert_id = await _dedup_or_insert(pool, result, len(events))
             if not was_new:
                 log.info(f"Dedup: incremented existing alert (seen {seen}×)")
                 continue
             await post_discord(http_client, result, len(events))
+
+            # Tier 3 escalation: only new, high-confidence critical alerts
+            # that haven't been escalated for the same category recently.
+            if tier3.should_escalate(result) and not _t3_recently_escalated(result):
+                await tier3.escalate(redis_client, alert_id, result)
 
         analyzer_metrics.busy.set(0)
         elapsed = time.perf_counter() - t_batch
@@ -902,6 +941,7 @@ async def main():
     tasks = [
         asyncio.create_task(analyze_loop(redis_client, pool, http_client)),
         asyncio.create_task(memory_loop(redis_client, pool, http_client)),
+        asyncio.create_task(tier3.forensic_loop(redis_client, pool, http_client)),
     ]
     try:
         await _shutdown_event.wait()

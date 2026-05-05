@@ -55,9 +55,12 @@ services:
       LIBRENMS_URL: ${LIBRENMS_URL:-}
       LIBRENMS_TOKEN: ${LIBRENMS_TOKEN:-}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_URL_T1: ${OLLAMA_URL_T1:-}
       OLLAMA_MODEL_FAST: ${OLLAMA_MODEL_FAST:-llama3.2:1b}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
       PROCESSOR_USE_FAST_LLM: ${PROCESSOR_USE_FAST_LLM:-0}
+      PROCESSOR_FAST_CONCURRENT: ${PROCESSOR_FAST_CONCURRENT:-4}
+      PROCESSOR_FAST_TIMEOUT: ${PROCESSOR_FAST_TIMEOUT:-4}
       TZ: ${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:9101/healthz || exit 1"]
@@ -72,7 +75,7 @@ services:
       - postgres
       - loki
 
-  # ── LLM anomaly analyzer + memory summariser ────────────────────────────────
+  # ── LLM anomaly analyzer + memory summariser + T3 forensics ─────────────────
   analyzer:
     build:
       context: .
@@ -84,13 +87,21 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       POSTGRES_DSN: postgresql://loglm:${POSTGRES_PASSWORD}@postgres:5432/loglm
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_URL_T2: ${OLLAMA_URL_T2:-}
+      OLLAMA_URL_T3: ${OLLAMA_URL_T3:-}
       OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
+      OLLAMA_MODEL_T3: ${OLLAMA_MODEL_T3:-}
       OLLAMA_MAX_CONCURRENT: ${OLLAMA_MAX_CONCURRENT:-2}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
       ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
       ANALYSIS_INTERVAL_SECONDS: ${ANALYSIS_INTERVAL_SECONDS:-60}
       MEMORY_INTERVAL_SECONDS: ${MEMORY_INTERVAL_SECONDS:-300}
+      T3_ENABLED: ${T3_ENABLED:-0}
+      T3_ESCALATION_THRESHOLD: ${T3_ESCALATION_THRESHOLD:-critical}
+      T3_CORRELATION_WINDOW: ${T3_CORRELATION_WINDOW:-300}
+      T3_MAX_TOKENS: ${T3_MAX_TOKENS:-2048}
+      T3_API_KEY: ${T3_API_KEY:-}
       TZ: ${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:9102/healthz || exit 1"]
@@ -114,9 +125,19 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
       LOKI_URL: http://loki:3100
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_URL_T1: ${OLLAMA_URL_T1:-}
+      OLLAMA_URL_T2: ${OLLAMA_URL_T2:-}
+      OLLAMA_URL_T3: ${OLLAMA_URL_T3:-}
+      OLLAMA_URL_CHAT: ${OLLAMA_URL_CHAT:-}
+      OLLAMA_MODEL_FAST: ${OLLAMA_MODEL_FAST:-llama3.2:1b}
       OLLAMA_MODEL_DEEP: ${OLLAMA_MODEL_DEEP:-llama3.1:8b-instruct-q4_K_M}
+      OLLAMA_MODEL_T3: ${OLLAMA_MODEL_T3:-}
       OLLAMA_MAX_CONCURRENT: ${OLLAMA_MAX_CONCURRENT:-2}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      T3_ENABLED: ${T3_ENABLED:-0}
+      T3_ESCALATION_THRESHOLD: ${T3_ESCALATION_THRESHOLD:-critical}
+      T3_CORRELATION_WINDOW: ${T3_CORRELATION_WINDOW:-300}
+      PROCESSOR_USE_FAST_LLM: ${PROCESSOR_USE_FAST_LLM:-0}
       LIBRENMS_URL: ${LIBRENMS_URL:-}
       LIBRENMS_TOKEN: ${LIBRENMS_TOKEN:-}
       SECRET_KEY: ${SECRET_KEY:-changeme-in-production}

@@ -19,7 +19,9 @@ import metrics as proc_metrics
 
 log = logging.getLogger(__name__)
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+# Per-tier URL takes priority; falls back to the global OLLAMA_URL
+OLLAMA_URL = (os.environ.get("OLLAMA_URL_T1", "") or
+              os.environ.get("OLLAMA_URL", "http://ollama:11434"))
 OLLAMA_MODEL_FAST = os.environ.get("OLLAMA_MODEL_FAST", "llama3.2:1b")
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 USE_FAST_LLM = os.environ.get("PROCESSOR_USE_FAST_LLM", "0") in ("1", "true", "yes")

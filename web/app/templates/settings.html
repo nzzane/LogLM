@@ -1,0 +1,545 @@
+{% extends "base.html" %}
+{% block title %}Settings · LogLM{% endblock %}
+
+{% block content %}
+<h1>LLM &amp; Pipeline Settings</h1>
+<p class="text-muted">
+  Configure per-tier Ollama instances, models, and escalation thresholds.
+  Changes take effect within 30 seconds — services poll for updates automatically.
+</p>
+
+<div class="card" id="deployment-card">
+  <div class="section-header"><h2>Deployment Mode</h2></div>
+  <p class="text-muted small">
+    Choose how Ollama instances are distributed across tiers. Tier URLs below are
+    used when the mode uses separate instances; leave blank to inherit the default URL.
+  </p>
+  <div id="mode-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem;margin-bottom:.75rem;">
+    <label class="mode-card" data-mode="single">
+      <input type="radio" name="deployment_mode" value="single" style="display:none">
+      <strong>Single Instance</strong>
+      <span class="text-muted small">One Ollama for all tiers. Simplest.</span>
+      <code>≥8 GB VRAM (shared)</code>
+    </label>
+    <label class="mode-card" data-mode="dual">
+      <input type="radio" name="deployment_mode" value="dual" style="display:none">
+      <strong>Dual (Fast + Deep)</strong>
+      <span class="text-muted small">T1 on one instance, T2+T3 on another.</span>
+      <code>2× Ollama processes</code>
+    </label>
+    <label class="mode-card" data-mode="triple">
+      <input type="radio" name="deployment_mode" value="triple" style="display:none">
+      <strong>Full Three-Tier</strong>
+      <span class="text-muted small">Dedicated instance per tier. Max throughput.</span>
+      <code>3× Ollama processes</code>
+    </label>
+    <label class="mode-card" data-mode="cloud_hybrid">
+      <input type="radio" name="deployment_mode" value="cloud_hybrid" style="display:none">
+      <strong>Cloud Hybrid</strong>
+      <span class="text-muted small">Local T1+T2, cloud/API for T3 forensics.</span>
+      <code>OpenAI-compatible API</code>
+    </label>
+  </div>
+</div>
+
+<!-- ── Tier cards ──────────────────────────────────────────────────────────── -->
+
+<div class="card" id="t1-card">
+  <div class="section-header">
+    <h2>Tier 1 — Fast Categorizer <span class="tier-badge t1">processor</span></h2>
+    <span class="health-dot" id="t1-health" title="Unknown"></span>
+  </div>
+  <p class="text-muted small">
+    Per-event keep/store/drop classification. Runs on every incoming log line before any
+    deeper analysis. Uses a signature cache so repeated patterns cost near-zero.
+    Recommended: <code>llama3.2:1b</code>, <code>qwen2.5:0.5b</code>.
+  </p>
+  <div class="settings-grid">
+    <label>Enabled
+      <input type="checkbox" id="t1-enabled">
+    </label>
+    <label>Ollama URL
+      <div style="display:flex;gap:.4rem;">
+        <input type="text" id="t1-url" placeholder="http://host.docker.internal:11434" style="flex:1">
+        <button class="test-btn" data-tier="t1">Test</button>
+      </div>
+    </label>
+    <label>Model
+      <div style="display:flex;gap:.4rem;">
+        <select id="t1-model" style="flex:1"><option value="">-- select --</option></select>
+        <input type="text" id="t1-model-custom" placeholder="or type model name" style="flex:1">
+      </div>
+    </label>
+    <label>Concurrency
+      <input type="number" id="t1-concurrency" min="1" max="16" value="4" style="width:80px">
+    </label>
+    <label>Timeout (s)
+      <input type="number" id="t1-timeout" min="1" max="60" value="4" style="width:80px">
+    </label>
+  </div>
+  <div class="test-result" id="t1-test-result"></div>
+</div>
+
+<div class="card" id="t2-card">
+  <div class="section-header">
+    <h2>Tier 2 — Correlation Analyzer <span class="tier-badge t2">analyzer</span></h2>
+    <span class="health-dot" id="t2-health" title="Unknown"></span>
+  </div>
+  <p class="text-muted small">
+    Batched cross-domain correlation: syslog + SNMP + nginx streams analyzed together.
+    Generates structured alerts and decides when to escalate to Tier 3.
+    Recommended: <code>llama3.1:8b-instruct-q4_K_M</code>, <code>qwen2.5:14b</code>.
+  </p>
+  <div class="settings-grid">
+    <label>Ollama URL
+      <div style="display:flex;gap:.4rem;">
+        <input type="text" id="t2-url" placeholder="http://host.docker.internal:11434" style="flex:1">
+        <button class="test-btn" data-tier="t2">Test</button>
+      </div>
+    </label>
+    <label>Model
+      <div style="display:flex;gap:.4rem;">
+        <select id="t2-model" style="flex:1"><option value="">-- select --</option></select>
+        <input type="text" id="t2-model-custom" placeholder="or type model name" style="flex:1">
+      </div>
+    </label>
+    <label>Max Concurrent
+      <input type="number" id="t2-concurrency" min="1" max="8" value="2" style="width:80px">
+    </label>
+    <label>Keep-Alive
+      <input type="text" id="t2-keepalive" placeholder="30m" style="width:100px">
+    </label>
+    <label>Batch Size
+      <input type="number" id="t2-batch" min="10" max="1000" value="120" style="width:100px">
+    </label>
+    <label>Interval (s)
+      <input type="number" id="t2-interval" min="5" max="3600" value="60" style="width:100px">
+    </label>
+  </div>
+  <div class="test-result" id="t2-test-result"></div>
+</div>
+
+<div class="card" id="t3-card">
+  <div class="section-header">
+    <h2>Tier 3 — Forensic Engine <span class="tier-badge t3">analyzer</span></h2>
+    <span class="health-dot" id="t3-health" title="Unknown"></span>
+  </div>
+  <p class="text-muted small">
+    Deep-dive causal chain analysis, historical incident matching, and Pre-Alert report
+    generation. Triggered only for high-confidence, multi-source critical events.
+    Asynchronous — does not block the alert pipeline.
+    Recommended: <code>qwen2.5:32b</code>, <code>llama3.3:70b</code>, or a cloud API.
+  </p>
+  <div class="settings-grid">
+    <label>Enabled
+      <input type="checkbox" id="t3-enabled">
+    </label>
+    <label>Ollama URL
+      <div style="display:flex;gap:.4rem;">
+        <input type="text" id="t3-url" placeholder="http://host.docker.internal:11434" style="flex:1">
+        <button class="test-btn" data-tier="t3">Test</button>
+      </div>
+    </label>
+    <label>Model
+      <div style="display:flex;gap:.4rem;">
+        <select id="t3-model" style="flex:1"><option value="">-- select --</option></select>
+        <input type="text" id="t3-model-custom" placeholder="or type model name" style="flex:1">
+      </div>
+    </label>
+    <label>API Key (optional)
+      <input type="password" id="t3-api-key" placeholder="sk-... (for OpenAI-compatible APIs)">
+    </label>
+    <label>Escalation Threshold
+      <select id="t3-threshold">
+        <option value="critical">Critical only</option>
+        <option value="high">High + Critical</option>
+        <option value="medium">Medium and above</option>
+      </select>
+    </label>
+    <label>Correlation Window (s)
+      <input type="number" id="t3-window" min="60" max="3600" value="300" style="width:100px">
+    </label>
+  </div>
+  <div class="test-result" id="t3-test-result"></div>
+</div>
+
+<div class="card" id="chat-card">
+  <div class="section-header">
+    <h2>Chat Model <span class="tier-badge chat">web</span></h2>
+    <span class="health-dot" id="chat-health" title="Unknown"></span>
+  </div>
+  <p class="text-muted small">
+    Model used for the interactive chat interface. Defaults to the deep (T2) model.
+    Can be overridden to a faster/cheaper model for chat if T2 is resource-constrained.
+  </p>
+  <div class="settings-grid">
+    <label>Ollama URL
+      <div style="display:flex;gap:.4rem;">
+        <input type="text" id="chat-url" placeholder="same as T2" style="flex:1">
+        <button class="test-btn" data-tier="chat">Test</button>
+      </div>
+    </label>
+    <label>Model
+      <div style="display:flex;gap:.4rem;">
+        <select id="chat-model" style="flex:1"><option value="">-- same as T2 --</option></select>
+        <input type="text" id="chat-model-custom" placeholder="or type model name" style="flex:1">
+      </div>
+    </label>
+  </div>
+  <div class="test-result" id="chat-test-result"></div>
+</div>
+
+<div style="display:flex;gap:.75rem;margin-top:1rem;align-items:center;">
+  <button id="save-all-btn" style="min-width:120px">Save All Settings</button>
+  <button id="reload-btn" class="secondary">Reload from DB</button>
+  <span id="save-msg" class="text-muted small"></span>
+</div>
+
+<div class="card" style="margin-top:1.5rem">
+  <div class="section-header"><h2>Current Environment Values</h2></div>
+  <p class="text-muted small">
+    Read-only. These are the values active when the containers started.
+    Settings above override these at runtime; a restart applies both.
+  </p>
+  <div class="kv-grid" id="env-grid">
+    <div><span class="k">loading...</span></div>
+  </div>
+</div>
+
+<style>
+.tier-badge {
+  display: inline-block;
+  font-size: .65rem;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-left: .35rem;
+}
+.tier-badge.t1  { background: #1a3a2a; color: #4ade80; }
+.tier-badge.t2  { background: #1a2a3a; color: #60a5fa; }
+.tier-badge.t3  { background: #3a1a2a; color: #f472b6; }
+.tier-badge.chat{ background: #2a2a1a; color: #facc15; }
+
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+  padding: .75rem;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.mode-card:hover         { border-color: #555; }
+.mode-card.selected      { border-color: #60a5fa; background: rgba(96,165,250,.07); }
+.mode-card strong        { font-size: .95rem; }
+.mode-card .text-muted   { font-size: .75rem; }
+.mode-card code          { font-size: .7rem; color: #888; }
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: .6rem .9rem;
+}
+.settings-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: .25rem;
+  font-size: .82rem;
+  color: #aaa;
+}
+.settings-grid input[type="text"],
+.settings-grid input[type="password"],
+.settings-grid input[type="number"],
+.settings-grid select {
+  background: var(--surface, #1e1e1e);
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #eee;
+  padding: .35rem .5rem;
+  font-size: .84rem;
+}
+
+.health-dot {
+  display: inline-block;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #555;
+  margin-left: .5rem;
+  flex-shrink: 0;
+}
+.health-dot.online  { background: #4ade80; }
+.health-dot.offline { background: #f87171; }
+.health-dot.unknown { background: #888; }
+
+.test-result {
+  margin-top: .5rem;
+  font-size: .78rem;
+  min-height: 1.2em;
+}
+.test-result.ok  { color: #4ade80; }
+.test-result.err { color: #f87171; }
+
+button.secondary {
+  background: transparent;
+  border: 1px solid #555;
+  color: #bbb;
+}
+button.secondary:hover { background: #333; }
+</style>
+
+<script>
+(function() {
+  // ── Tier field mappings ──────────────────────────────────────────────────
+  const TIERS = {
+    t1:   { url: 't1-url',   model: 't1-model',   custom: 't1-model-custom'   },
+    t2:   { url: 't2-url',   model: 't2-model',   custom: 't2-model-custom'   },
+    t3:   { url: 't3-url',   model: 't3-model',   custom: 't3-model-custom'   },
+    chat: { url: 'chat-url', model: 'chat-model', custom: 'chat-model-custom' },
+  };
+
+  // ── Deployment mode card ─────────────────────────────────────────────────
+  let currentMode = 'single';
+  document.querySelectorAll('.mode-card').forEach(card => {
+    card.addEventListener('click', () => {
+      document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
+      card.classList.add('selected');
+      currentMode = card.dataset.mode;
+      card.querySelector('input[type=radio]').checked = true;
+    });
+  });
+
+  function setMode(mode) {
+    currentMode = mode || 'single';
+    document.querySelectorAll('.mode-card').forEach(c => {
+      c.classList.toggle('selected', c.dataset.mode === currentMode);
+    });
+  }
+
+  // ── Populate model dropdowns from Ollama ────────────────────────────────
+  const modelCache = {};
+
+  async function loadModels(tier) {
+    const urlInput = document.getElementById(TIERS[tier].url);
+    const sel = document.getElementById(TIERS[tier].model);
+    const url = (urlInput && urlInput.value.trim()) || '';
+    if (!url) return;
+
+    const cacheKey = url;
+    if (modelCache[cacheKey]) {
+      populateSelect(sel, modelCache[cacheKey]);
+      return;
+    }
+
+    try {
+      const r = await fetch('/api/settings/models?url=' + encodeURIComponent(url));
+      if (!r.ok) return;
+      const data = await r.json();
+      modelCache[cacheKey] = data.models || [];
+      populateSelect(sel, modelCache[cacheKey]);
+    } catch (e) { /* silently ignore */ }
+  }
+
+  function populateSelect(sel, models) {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">-- select --</option>';
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      sel.appendChild(opt);
+    });
+    if (current && models.includes(current)) sel.value = current;
+  }
+
+  // Auto-load models when URL input loses focus
+  Object.keys(TIERS).forEach(tier => {
+    const urlEl = document.getElementById(TIERS[tier].url);
+    if (urlEl) {
+      urlEl.addEventListener('blur', () => loadModels(tier));
+    }
+  });
+
+  // ── Test connection ──────────────────────────────────────────────────────
+  document.querySelectorAll('.test-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const tier = btn.dataset.tier;
+      const urlInput = document.getElementById(TIERS[tier].url);
+      const url = (urlInput && urlInput.value.trim()) || '';
+      const result = document.getElementById(tier + '-test-result');
+      const dot = document.getElementById(tier + '-health');
+      if (!url) {
+        result.className = 'test-result err';
+        result.textContent = 'Enter a URL first';
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Testing...';
+      result.className = 'test-result';
+      result.textContent = '';
+      try {
+        const r = await fetch('/api/settings/test-connection', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ url }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          result.className = 'test-result ok';
+          result.textContent = `Connected — ${d.model_count} model(s) available (${d.latency_ms}ms)`;
+          dot.className = 'health-dot online';
+          dot.title = 'Online';
+          if (d.models) {
+            modelCache[url] = d.models;
+            populateSelect(document.getElementById(TIERS[tier].model), d.models);
+          }
+        } else {
+          result.className = 'test-result err';
+          result.textContent = d.error || 'Connection failed';
+          dot.className = 'health-dot offline';
+          dot.title = 'Offline';
+        }
+      } catch (e) {
+        result.className = 'test-result err';
+        result.textContent = 'Request failed: ' + e;
+        dot.className = 'health-dot offline';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test';
+      }
+    });
+  });
+
+  // ── Helper: get model value (select or custom text) ─────────────────────
+  function getTierModel(tier) {
+    const sel = document.getElementById(TIERS[tier].model);
+    const custom = document.getElementById(TIERS[tier].custom);
+    return (custom && custom.value.trim()) || (sel && sel.value) || '';
+  }
+
+  // ── Collect settings from form ───────────────────────────────────────────
+  function collectSettings() {
+    const g = id => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+    const chk = id => { const el = document.getElementById(id); return el ? (el.checked ? '1' : '0') : '0'; };
+    return {
+      ollama_deployment_mode:      currentMode,
+      ollama_url_t1:               g('t1-url'),
+      ollama_model_fast:           getTierModel('t1'),
+      t1_enabled:                  chk('t1-enabled'),
+      t1_concurrency:              g('t1-concurrency') || '4',
+      t1_timeout:                  g('t1-timeout')     || '4',
+      ollama_url_t2:               g('t2-url'),
+      ollama_model_deep:           getTierModel('t2'),
+      ollama_max_concurrent:       g('t2-concurrency') || '2',
+      ollama_keep_alive:           g('t2-keepalive')   || '30m',
+      analyzer_batch:              g('t2-batch')        || '120',
+      analysis_interval_seconds:   g('t2-interval')     || '60',
+      ollama_url_t3:               g('t3-url'),
+      ollama_model_t3:             getTierModel('t3'),
+      t3_api_key:                  g('t3-api-key'),
+      t3_enabled:                  chk('t3-enabled'),
+      t3_escalation_threshold:     g('t3-threshold')    || 'critical',
+      t3_correlation_window:       g('t3-window')        || '300',
+      ollama_url_chat:             g('chat-url'),
+      ollama_model_chat:           getTierModel('chat'),
+    };
+  }
+
+  // ── Apply settings to form ───────────────────────────────────────────────
+  function applySettings(s) {
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+    const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = v === '1' || v === true; };
+
+    setMode(s.ollama_deployment_mode || 'single');
+
+    setVal('t1-url',           s.ollama_url_t1 || '');
+    setVal('t1-model-custom',  s.ollama_model_fast || '');
+    setChk('t1-enabled',       s.t1_enabled);
+    setVal('t1-concurrency',   s.t1_concurrency || '4');
+    setVal('t1-timeout',       s.t1_timeout || '4');
+
+    setVal('t2-url',           s.ollama_url_t2 || '');
+    setVal('t2-model-custom',  s.ollama_model_deep || '');
+    setVal('t2-concurrency',   s.ollama_max_concurrent || '2');
+    setVal('t2-keepalive',     s.ollama_keep_alive || '30m');
+    setVal('t2-batch',         s.analyzer_batch || '120');
+    setVal('t2-interval',      s.analysis_interval_seconds || '60');
+
+    setVal('t3-url',           s.ollama_url_t3 || '');
+    setVal('t3-model-custom',  s.ollama_model_t3 || '');
+    setChk('t3-enabled',       s.t3_enabled);
+    if (s.t3_escalation_threshold) {
+      const el = document.getElementById('t3-threshold');
+      if (el) el.value = s.t3_escalation_threshold;
+    }
+    setVal('t3-window',        s.t3_correlation_window || '300');
+
+    setVal('chat-url',         s.ollama_url_chat || '');
+    setVal('chat-model-custom',s.ollama_model_chat || '');
+  }
+
+  // ── Load settings from API ───────────────────────────────────────────────
+  async function loadSettings() {
+    try {
+      const r = await fetch('/api/settings');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      applySettings(data.settings || {});
+      renderEnvGrid(data.env || {});
+    } catch (e) {
+      document.getElementById('save-msg').textContent = 'load error: ' + e;
+    }
+  }
+
+  function renderEnvGrid(env) {
+    const grid = document.getElementById('env-grid');
+    const keys = Object.keys(env);
+    if (!keys.length) {
+      grid.innerHTML = '<div><span class="k text-muted">no env data</span></div>';
+      return;
+    }
+    grid.innerHTML = keys.sort().map(k =>
+      `<div><span class="k">${escHtml(k)}</span>` +
+      `<span class="v" style="font-family:monospace;font-size:.78rem;">${escHtml(env[k])}</span></div>`
+    ).join('');
+  }
+
+  function escHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // ── Save settings ────────────────────────────────────────────────────────
+  document.getElementById('save-all-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('save-all-btn');
+    const msg = document.getElementById('save-msg');
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    msg.textContent = '';
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(collectSettings()),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+      msg.textContent = 'Saved. Services will pick up changes within ~30s.';
+      msg.style.color = '#4ade80';
+    } catch (e) {
+      msg.textContent = 'Error: ' + e;
+      msg.style.color = '#f87171';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Save All Settings';
+    }
+  });
+
+  document.getElementById('reload-btn').addEventListener('click', loadSettings);
+
+  // ── Init ─────────────────────────────────────────────────────────────────
+  loadSettings();
+})();
+</script>
+{% endblock %}

@@ -731,3 +731,42 @@ BEGIN
     RETURN dropped;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Runtime-editable settings (Three-tier LLM configuration, Ollama URLs, etc.)
+-- Created here so all services can rely on this table existing at DB init,
+-- regardless of which service starts first.
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS loglm_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Tier 3 forensic Pre-Alert reports
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS pre_alert_reports (
+    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    trigger_alert_id          BIGINT,
+    severity                  TEXT NOT NULL DEFAULT 'high',
+    headline                  TEXT NOT NULL DEFAULT '',
+    executive_summary         TEXT NOT NULL DEFAULT '',
+    probable_root_causes      JSONB NOT NULL DEFAULT '[]',
+    causal_chain              JSONB NOT NULL DEFAULT '[]',
+    recommended_actions       JSONB NOT NULL DEFAULT '[]',
+    historical_match          JSONB,
+    false_positive_assessment JSONB,
+    raw_context_summary       JSONB,
+    model_used                TEXT NOT NULL DEFAULT '',
+    acknowledged              BOOLEAN NOT NULL DEFAULT FALSE,
+    acknowledged_by           TEXT,
+    acknowledged_at           TIMESTAMPTZ,
+    outcome                   TEXT,
+    outcome_matched_prediction BOOLEAN
+);
+CREATE INDEX IF NOT EXISTS idx_pre_alert_created
+    ON pre_alert_reports (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pre_alert_unacked
+    ON pre_alert_reports (acknowledged) WHERE NOT acknowledged;
