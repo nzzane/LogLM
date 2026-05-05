@@ -30,11 +30,58 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from app import auth, observability
-from app import opscenter as ops
-from app import hitl as hitl_mod
-from app import correlation as corr_engine
-from app import log_tiers
+import importlib.util as _ilu
+import pathlib as _pl
+import sys as _sys
+
+
+def _load_app_module(name: str):
+    """
+    Load a sibling module from this file's own directory using its absolute
+    filesystem path, completely bypassing Python's package-namespace resolver.
+
+    Why this is necessary
+    ---------------------
+    When Docker's layer cache serves a stale ``COPY . .`` layer created before
+    ``app/__init__.py`` existed, Python never sees ``__init__.py`` and treats
+    ``app/`` as a namespace package (PEP 420).  Namespace packages have
+    ``__file__ = None`` and report ``(unknown location)`` in tracebacks.
+    ``from app import opscenter`` then fails because the namespace package
+    has no record of ``opscenter`` as a submodule.
+
+    Loading by absolute path sidesteps the resolver entirely.  Registering
+    each module in ``sys.modules`` under its canonical ``app.<name>`` key
+    means that deferred ``from app.<name> import Y`` calls inside sibling
+    modules (e.g. the ``from app.opscenter import HITL_APPROVERS`` inside
+    hitl.py's async functions) will find the already-loaded module without
+    re-triggering namespace resolution.
+    """
+    full = f"app.{name}"
+    if full in _sys.modules:
+        return _sys.modules[full]
+    path = _pl.Path(__file__).parent / f"{name}.py"
+    spec = _ilu.spec_from_file_location(full, path)
+    if spec is None:
+        raise ImportError(
+            f"Cannot locate {path}. "
+            f"Ensure the file exists in the app/ directory."
+        )
+    mod = _ilu.module_from_spec(spec)
+    # Register BEFORE exec_module so any internal cross-imports that reference
+    # this module (directly or via sys.modules) find it already present.
+    _sys.modules[full] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+# Load every app submodule by absolute path.  This is equivalent to the
+# standard 'from app import X' but immune to namespace-package cache drift.
+auth          = _load_app_module("auth")
+observability = _load_app_module("observability")
+ops           = _load_app_module("opscenter")
+hitl_mod      = _load_app_module("hitl")
+corr_engine   = _load_app_module("correlation")
+log_tiers     = _load_app_module("log_tiers")
 
 try:
     import docker as docker_sdk
