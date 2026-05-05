@@ -4674,22 +4674,66 @@ async def _run_topology_discovery():
     print(f"[topology_discover] complete: {discovered} neighbours discovered")
 
 
-async def _snmp_get_lldp_neighbours(host: str, community: str) -> list[str]:
+def _import_pysnmp_nextcmd():
     """
-    Walk lldpRemSysName OID to get names of directly-connected neighbours.
-    Returns a list of neighbour hostnames/IPs.
-    Falls back gracefully if the device doesn't support LLDP MIB.
+    Return pysnmp's nextCmd and associated classes, compatible with both the
+    pysnmp 7.x API (lextudio re-release, installed here) and the legacy 6.x
+    API path that pysnmplib used to expose.
+
+    pysnmp version history on PyPI:
+      <=4.4.12  Ilya Etingof's original.  hlapi.asyncio existed.
+      5.x–6.x   LexTudio fork, same pysnmp name.  hlapi.asyncio still present.
+      7.x        LexTudio 7.x reorganised into hlapi.v3arch.asyncio; the old
+                 hlapi.asyncio shim was kept for compat in some 7.x releases
+                 but removed later.
+      pysnmplib  Separate, abandoned fork.  Max release 5.0.24.  No version 6+.
+
+    We try the 7.x path first, then the legacy path, so the code works across
+    the version range already declared in requirements.txt (pysnmp>=7.1.0,<8).
     """
+    # pysnmp 7.x preferred path
     try:
-        from pysnmp.hlapi.asyncio import (
-            getCmd, nextCmd, SnmpEngine, CommunityData, UdpTransportTarget,
+        from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore[import]
+            nextCmd, SnmpEngine, CommunityData, UdpTransportTarget,
             ContextData, ObjectType, ObjectIdentity,
         )
-        LLDP_REM_SYSNAME = "1.0.8802.1.1.2.1.4.1.1.9"
-        engine   = SnmpEngine()
-        target   = UdpTransportTarget((host, 161), timeout=3, retries=1)
+        return nextCmd, SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
+    except ImportError:
+        pass
+
+    # pysnmp <=6.x / legacy hlapi.asyncio shim (kept in early 7.x)
+    try:
+        from pysnmp.hlapi.asyncio import (  # type: ignore[import]
+            nextCmd, SnmpEngine, CommunityData, UdpTransportTarget,
+            ContextData, ObjectType, ObjectIdentity,
+        )
+        return nextCmd, SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
+    except ImportError:
+        pass
+
+    return None
+
+
+async def _snmp_get_lldp_neighbours(host: str, community: str) -> list[str]:
+    """
+    Walk lldpRemSysName OID (1.0.8802.1.1.2.1.4.1.1.9) to discover directly
+    connected LLDP neighbours.  Returns an empty list if pysnmp is unavailable,
+    the device is unreachable, or the device does not support the LLDP MIB.
+    """
+    LLDP_REM_SYSNAME = "1.0.8802.1.1.2.1.4.1.1.9"
+    try:
+        imports = _import_pysnmp_nextcmd()
+        if imports is None:
+            print(f"[topology_discover] pysnmp asyncio API not available for {host} — skipping LLDP walk")
+            return []
+
+        nextCmd, SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity = imports
+
+        engine         = SnmpEngine()
+        target         = UdpTransportTarget((host, 161), timeout=3, retries=1)
         community_data = CommunityData(community, mpModel=1)
         neighbours: list[str] = []
+
         async for (errInd, errStatus, errIdx, varBinds) in nextCmd(
             engine, community_data, target, ContextData(),
             ObjectType(ObjectIdentity(LLDP_REM_SYSNAME)),
@@ -4698,14 +4742,14 @@ async def _snmp_get_lldp_neighbours(host: str, community: str) -> list[str]:
             if errInd or errStatus:
                 break
             for varBind in varBinds:
-                oid_str = str(varBind[0])
-                if LLDP_REM_SYSNAME not in oid_str:
+                if LLDP_REM_SYSNAME not in str(varBind[0]):
                     break
                 nbr_name = str(varBind[1]).strip()
                 if nbr_name:
                     neighbours.append(nbr_name)
         return neighbours[:20]
-    except Exception:
+    except Exception as e:
+        print(f"[topology_discover] LLDP walk {host}: {e}")
         return []
 
 
