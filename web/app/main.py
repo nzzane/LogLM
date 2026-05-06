@@ -2966,6 +2966,126 @@ async def api_system_set_ntp(p: NtpPayload):
 #  CHAT WITH MEMORY
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ── Regex-based HITL intent detection ────────────────────────────────────────
+# Catches filter rule requests ("ignore X on Y") in the user's raw message
+# without relying on the LLM to emit a structured JSON block.  This is the
+# reliable fallback when the model runs out of tokens or doesn't follow format.
+
+import re as _re
+
+# "ignore/suppress/hide/exclude/filter/block X [errors|warnings|...] on/from/for HOST [and HOST ...]"
+_IGNORE_RE = _re.compile(
+    r"(?:ignore|suppress|hide|exclude|filter out?|stop logging|block|mute)\s+"
+    r"(?:all\s+)?(?:the\s+)?"
+    r"(?P<pattern>[\w][\w\s\-/]{0,60}?)"
+    r"(?:\s+(?:errors?|warnings?|messages?|logs?|events?|alerts?))?\s+"
+    r"(?:on|from|for|at|coming from)\s+"
+    r"(?P<hosts>.{3,120})",
+    _re.IGNORECASE,
+)
+
+# "create [a] [filter] rule to ignore / add rule to suppress / add filter for"
+_RULE_VERB_RE = _re.compile(
+    r"(?:create|add|make|set up?|configure|apply)\s+(?:a\s+)?(?:filter|rule|custom rule|ignore rule)?\s*"
+    r"(?:to|for)\s+(?:ignore|suppress|filter out?|hide|exclude)\s+"
+    r"(?:all\s+)?(?P<pattern>[\w][\w\s\-/]{0,60}?)"
+    r"(?:\s+(?:errors?|warnings?|messages?|logs?|events?))?\s+"
+    r"(?:on|from|for|at)\s+"
+    r"(?P<hosts>.{3,120})",
+    _re.IGNORECASE,
+)
+
+# "mark X as important on HOST"
+_IMPORTANT_RE = _re.compile(
+    r"(?:mark|flag|alert on|watch for|keep)\s+"
+    r"(?P<pattern>[\w][\w\s\-/]{0,60}?)"
+    r"(?:\s+(?:errors?|warnings?|messages?|logs?|events?))?\s+"
+    r"(?:as\s+important\s+)?(?:on|from|for|at)\s+"
+    r"(?P<hosts>.{3,120})"
+    r"(?:\s+as\s+important)?",
+    _re.IGNORECASE,
+)
+
+# Extract hostname tokens from messy natural-language strings:
+# "the APs (U6-LR and U7-Pro)" → ["U6-LR", "U7-Pro"]
+# "unifi-ap-office, switch-01" → ["unifi-ap-office", "switch-01"]
+_HOSTNAME_RE = _re.compile(r"\b([A-Za-z0-9][A-Za-z0-9\-_.]{1,62})\b")
+_HOST_STOPWORDS = frozenset({
+    "the", "all", "any", "and", "or", "for", "on", "from", "at", "both",
+    "ap", "aps", "router", "routers", "switch", "switches", "device", "devices",
+    "host", "hosts", "server", "servers", "network", "interface", "interfaces",
+    "these", "those", "this", "that", "with", "using", "via",
+})
+
+
+def _split_hosts(raw: str) -> list[str]:
+    tokens = _HOSTNAME_RE.findall(raw)
+    return [t for t in tokens if t.lower() not in _HOST_STOPWORDS][:8]
+
+
+def _detect_rule_intent(message: str) -> dict | None:
+    """
+    Parse the user's raw message for common filter-rule request patterns.
+    Returns a proposal_data dict compatible with hitl_mod.propose_action(),
+    or None if no actionable intent is detected.
+    """
+    # Try ignore patterns
+    for pattern_re, verdict in [
+        (_IGNORE_RE, "ignore"),
+        (_RULE_VERB_RE, "ignore"),
+    ]:
+        m = pattern_re.search(message)
+        if m:
+            raw_pattern = m.group("pattern").strip().lower()
+            raw_hosts   = m.group("hosts")
+            hosts = _split_hosts(raw_hosts)
+            if not raw_pattern or not hosts:
+                continue
+            rules = [
+                {"verdict": "ignore", "host": h, "program": "", "pattern": raw_pattern}
+                for h in hosts
+            ]
+            # Also add a host-agnostic rule if user used plural/generic phrasing
+            if len(hosts) > 1 or any(
+                kw in message.lower() for kw in ("all", "every", "any ap", "the aps")
+            ):
+                rules.append({"verdict": "ignore", "host": "", "program": "", "pattern": raw_pattern})
+            return {
+                "action_type":  "create_feedback_rule",
+                "action_title": f"Ignore '{raw_pattern}' on {', '.join(hosts[:2])}{'…' if len(hosts) > 2 else ''}",
+                "action_desc":  (
+                    f"Create filter rules to suppress log messages matching "
+                    f"'{raw_pattern}' from {', '.join(hosts)}. "
+                    f"These events will be dropped before reaching the LLM analyser."
+                ),
+                "risk_level":   "low",
+                "payload":      {"rules": rules},
+            }
+
+    # Try important pattern
+    m = _IMPORTANT_RE.search(message)
+    if m:
+        raw_pattern = m.group("pattern").strip().lower()
+        raw_hosts   = m.group("hosts")
+        hosts = _split_hosts(raw_hosts)
+        if raw_pattern and hosts:
+            rules = [
+                {"verdict": "important", "host": h, "program": "", "pattern": raw_pattern}
+                for h in hosts
+            ]
+            return {
+                "action_type":  "create_feedback_rule",
+                "action_title": f"Mark '{raw_pattern}' as important on {', '.join(hosts[:2])}",
+                "action_desc":  (
+                    f"Create filter rules to mark messages matching '{raw_pattern}' "
+                    f"from {', '.join(hosts)} as important — they will always reach the LLM analyser."
+                ),
+                "risk_level":   "low",
+                "payload":      {"rules": rules},
+            }
+
+    return None
+
 CHAT_SYSTEM_QUICK = """You are LogLM Quick, an AI assistant for a home/small-office network monitor.
 You have access to memory summaries, current SNMP metrics, recent notable events, and alerts.
 
@@ -3637,6 +3757,11 @@ async def chat_send(req: ChatRequest, request: Request):
     )
     if user_can_propose:
         system_prompt = system_prompt + "\n\n" + hitl_mod.HITL_DETECTION_SYSTEM
+        # Give the model enough tokens to output both an explanation AND
+        # the hitl_action block.  Quick mode defaults to 800 which is
+        # typically consumed by the explanation alone.
+        if num_predict < 1400:
+            num_predict = 1400
 
     # Build prompt with conversation history
     agent_name = "LogLM Investigator" if mode == "deep" else "LogLM"
@@ -3692,12 +3817,23 @@ async def chat_send(req: ChatRequest, request: Request):
         answer = "I don't have enough data to answer that right now. Events may still be collecting."
 
     # ── HITL proposal extraction ───────────────────────────────────────────────
-    # If the LLM included a ```hitl_action``` block, parse it, queue the action
-    # for admin approval, and strip the raw block from the displayed response
-    # (replaced by a clean card rendered on the client side).
+    # Two-path detection:
+    #
+    # Path A — LLM-emitted block: the model follows the HITL prompt and includes
+    #   a ```hitl_action``` JSON block. Reliable on 7B+ models but fails on small
+    #   models that run out of tokens before reaching the block (Quick mode caps
+    #   at 800 tokens, which the explanation often fills completely).
+    #
+    # Path B — Regex intent detection: parse the *user's* raw message for known
+    #   filter-rule patterns ("ignore X on Y", "create rule to suppress X from Y",
+    #   "mark X as important on Y"). This runs regardless of the LLM output and
+    #   is the reliable fallback that ensures the proposal always fires.
     hitl_proposal: dict | None = None
     if user_can_propose:
         proposal_data = hitl_mod.extract_hitl_proposal(answer)
+        if not proposal_data:
+            # Path B: regex detection on the user's original message
+            proposal_data = _detect_rule_intent(req.message)
         if proposal_data:
             try:
                 ip = auth._client_ip(request)
