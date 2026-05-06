@@ -1,0 +1,280 @@
+{% extends "base.html" %}
+{% block title %}User Management · LogLM{% endblock %}
+
+{% block content %}
+<div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem;">
+  <h1 style="margin:0">User Management</h1>
+  <button class="btn" style="margin-left:auto" onclick="openCreateModal()">+ New User</button>
+</div>
+
+<div class="card" style="margin-bottom:.75rem;border-left:3px solid var(--info);">
+  <p style="font-size:.82rem;color:var(--text-muted);margin:0;">
+    <strong>RBAC roles:</strong>
+    <span class="role-badge role-admin">admin</span> full access, HITL approval, user management ·
+    <span class="role-badge role-operator">operator</span> alerts, LLM proposals, silences ·
+    <span class="role-badge role-viewer">viewer</span> read-only
+  </p>
+</div>
+
+<div class="card">
+  <table class="device-table" id="users-table">
+    <thead>
+      <tr>
+        <th>Username</th><th>Display name</th><th>Email</th><th>Role</th>
+        <th>Status</th><th>Last login</th><th>Sessions</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for u in users %}
+    <tr data-uid="{{ u.id }}" data-uname="{{ u.username }}" data-role="{{ u.role }}">
+      <td><strong>{{ u.username }}</strong></td>
+      <td>{{ u.display_name or '—' }}</td>
+      <td>{{ u.email or '—' }}</td>
+      <td><span class="role-badge role-{{ u.role }}">{{ u.role }}</span></td>
+      <td>
+        {% if u.disabled %}
+          <span class="badge" style="background:rgba(240,79,89,.15);color:var(--err);">disabled</span>
+        {% else %}
+          <span class="badge badge-ok">active</span>
+        {% endif %}
+      </td>
+      <td class="text-muted" style="font-size:.78rem;">
+        {{ u.last_login.strftime('%b %d %H:%M') if u.last_login else '—' }}
+      </td>
+      <td class="text-muted" style="font-size:.78rem;">{{ u.active_sessions }}</td>
+      <td class="device-actions">
+        <button class="btn ghost" style="font-size:.7rem" onclick="openEditModal(this)">Edit</button>
+        <button class="btn ghost" style="font-size:.7rem" onclick="revokeAllSessions({{ u.id }}, this)">Revoke sessions</button>
+        <button class="btn ghost danger" style="font-size:.7rem" onclick="deleteUser({{ u.id }}, '{{ u.username }}', this)">Delete</button>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── API Keys section ─────────────────────────────────────────────────── -->
+<div class="card" style="margin-top:1rem;">
+  <div class="section-header">
+    <h2>API Keys</h2>
+    <button class="btn ghost" style="font-size:.75rem" onclick="loadApiKeys()">Refresh</button>
+  </div>
+  <div id="apikeys-mount" class="text-muted" style="font-size:.82rem;">Loading…</div>
+</div>
+
+<!-- ── Create user modal ─────────────────────────────────────────────────── -->
+<div id="create-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-box">
+    <h2 style="margin-bottom:1rem;">Create User</h2>
+    <div class="modal-form">
+      <label>Username <input id="cu-username" type="text" placeholder="jsmith" autocomplete="off"></label>
+      <label>Display name <input id="cu-displayname" type="text" placeholder="Jane Smith"></label>
+      <label>Email <input id="cu-email" type="email" placeholder="jane@example.com"></label>
+      <label>Password
+        <input id="cu-password" type="password" autocomplete="new-password" placeholder="min 8 characters">
+      </label>
+      <label>Role
+        <select id="cu-role">
+          {% for r in roles %}
+          <option value="{{ r }}" {% if r == 'viewer' %}selected{% endif %}>{{ r }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="createUser()">Create</button>
+      <button class="btn ghost" onclick="closeModal('create-modal')">Cancel</button>
+    </div>
+    <div class="modal-error" id="cu-error"></div>
+  </div>
+</div>
+
+<!-- ── Edit user modal ─────────────────────────────────────────────────── -->
+<div id="edit-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-box">
+    <h2 style="margin-bottom:1rem;">Edit User: <span id="eu-name"></span></h2>
+    <input type="hidden" id="eu-uid">
+    <div class="modal-form">
+      <label>Display name <input id="eu-displayname" type="text"></label>
+      <label>Email <input id="eu-email" type="email"></label>
+      <label>Role
+        <select id="eu-role">
+          {% for r in roles %}
+          <option value="{{ r }}">{{ r }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:.5rem;">
+        <input type="checkbox" id="eu-disabled"> Disabled (blocks login)
+      </label>
+      <label>New password <small style="color:var(--text-muted)">(leave blank to keep current)</small>
+        <input id="eu-password" type="password" autocomplete="new-password" placeholder="blank = no change">
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="updateUser()">Save</button>
+      <button class="btn ghost" onclick="closeModal('edit-modal')">Cancel</button>
+    </div>
+    <div class="modal-error" id="eu-error"></div>
+  </div>
+</div>
+
+<style>
+.role-badge {
+  display: inline-block; font-size: .68rem; font-weight: 600;
+  padding: 2px 8px; border-radius: 3px;
+}
+.role-admin    { background: rgba(240,79,89,.15);  color: #f04f59; }
+.role-operator { background: rgba(245,166,35,.15); color: #f5a623; }
+.role-viewer   { background: rgba(91,192,222,.1);  color: var(--info); }
+
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-box {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1.5rem; min-width: 380px; max-width: 520px; width: 100%;
+}
+.modal-form {
+  display: flex; flex-direction: column; gap: .6rem;
+}
+.modal-form label {
+  display: flex; flex-direction: column; gap: .2rem;
+  font-size: .82rem; color: var(--text-muted);
+}
+.modal-form input, .modal-form select {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text); padding: .35rem .5rem; font-size: .84rem;
+}
+.modal-footer { display: flex; gap: .5rem; margin-top: 1rem; }
+.modal-error  { font-size: .78rem; color: var(--err); margin-top: .4rem; min-height: 1em; }
+</style>
+
+<script>
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+function openCreateModal() {
+  document.getElementById('cu-error').textContent = '';
+  ['cu-username','cu-displayname','cu-email','cu-password'].forEach(i => {
+    document.getElementById(i).value = '';
+  });
+  document.getElementById('cu-role').value = 'viewer';
+  document.getElementById('create-modal').style.display = 'flex';
+}
+
+function openEditModal(btn) {
+  const tr = btn.closest('tr');
+  document.getElementById('eu-uid').value       = tr.dataset.uid;
+  document.getElementById('eu-name').textContent = tr.dataset.uname;
+  document.getElementById('eu-role').value       = tr.dataset.role;
+  const cells = tr.querySelectorAll('td');
+  document.getElementById('eu-displayname').value = cells[1].textContent === '—' ? '' : cells[1].textContent;
+  document.getElementById('eu-email').value       = cells[2].textContent === '—' ? '' : cells[2].textContent;
+  document.getElementById('eu-disabled').checked  = cells[4].textContent.includes('disabled');
+  document.getElementById('eu-password').value    = '';
+  document.getElementById('eu-error').textContent = '';
+  document.getElementById('edit-modal').style.display = 'flex';
+}
+
+async function createUser() {
+  const errEl = document.getElementById('cu-error');
+  const payload = {
+    username:     document.getElementById('cu-username').value.trim(),
+    display_name: document.getElementById('cu-displayname').value.trim() || null,
+    email:        document.getElementById('cu-email').value.trim() || null,
+    password:     document.getElementById('cu-password').value,
+    role:         document.getElementById('cu-role').value,
+  };
+  if (!payload.username || !payload.password) {
+    errEl.textContent = 'Username and password are required'; return;
+  }
+  try {
+    const r = await fetch('/api/users', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || 'Error ' + r.status; return; }
+    location.reload();
+  } catch(e) { errEl.textContent = String(e); }
+}
+
+async function updateUser() {
+  const uid = document.getElementById('eu-uid').value;
+  const pw  = document.getElementById('eu-password').value;
+  const errEl = document.getElementById('eu-error');
+  const payload = {
+    role:         document.getElementById('eu-role').value,
+    display_name: document.getElementById('eu-displayname').value.trim() || null,
+    email:        document.getElementById('eu-email').value.trim() || null,
+    disabled:     document.getElementById('eu-disabled').checked,
+  };
+  if (pw) payload.new_password = pw;
+  try {
+    const r = await fetch(`/api/users/${uid}`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || 'Error ' + r.status; return; }
+    location.reload();
+  } catch(e) { errEl.textContent = String(e); }
+}
+
+async function deleteUser(uid, uname, btn) {
+  if (!confirm(`Delete user "${uname}"? This cannot be undone.`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/users/${uid}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.detail || 'Delete failed'); btn.disabled = false; return; }
+    btn.closest('tr').remove();
+  } catch(e) { alert(String(e)); btn.disabled = false; }
+}
+
+async function revokeAllSessions(uid, btn) {
+  if (!confirm('Revoke all active sessions for this user?')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/users/${uid}/revoke-sessions`, { method: 'POST' });
+    const d = await r.json();
+    if (r.ok) { btn.textContent = `Revoked (${d.revoked})`; }
+    else { btn.disabled = false; alert(d.detail || 'Failed'); }
+  } catch(e) { btn.disabled = false; alert(String(e)); }
+}
+
+async function loadApiKeys() {
+  const mount = document.getElementById('apikeys-mount');
+  try {
+    const r = await fetch('/api/api-keys');
+    if (!r.ok) { mount.textContent = 'Error loading API keys'; return; }
+    const keys = await r.json();
+    if (!keys.length) { mount.innerHTML = '<em>No API keys configured.</em>'; return; }
+    mount.innerHTML = `<table class="device-table"><thead><tr>
+      <th>Name</th><th>Prefix</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Expires</th><th></th>
+    </tr></thead><tbody>` + keys.map(k => `<tr>
+      <td>${esc(k.name)}</td>
+      <td><code>${esc(k.key_prefix)}…</code></td>
+      <td>${(k.scopes||[]).map(s=>`<span class="badge">${esc(s)}</span>`).join(' ')}</td>
+      <td class="text-muted" style="font-size:.75rem;">${k.created_at ? new Date(k.created_at).toLocaleDateString() : '—'}</td>
+      <td class="text-muted" style="font-size:.75rem;">${k.last_used ? new Date(k.last_used).toLocaleDateString() : 'never'}</td>
+      <td class="text-muted" style="font-size:.75rem;">${k.expires_at ? new Date(k.expires_at).toLocaleDateString() : 'never'}</td>
+      <td><button class="btn ghost danger" style="font-size:.7rem" onclick="revokeKey(${k.id},this)">Revoke</button></td>
+    </tr>`).join('') + '</tbody></table>';
+  } catch(e) { mount.textContent = String(e); }
+}
+loadApiKeys();
+
+async function revokeKey(id, btn) {
+  if (!confirm('Revoke this API key? It will stop working immediately.')) return;
+  btn.disabled = true;
+  const r = await fetch(`/api/api-keys/${id}`, { method: 'DELETE' });
+  if (r.ok) { loadApiKeys(); } else { btn.disabled = false; alert('Failed'); }
+}
+</script>
+{% endblock %}

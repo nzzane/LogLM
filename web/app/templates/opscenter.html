@@ -1,0 +1,372 @@
+{% extends "base.html" %}
+{% block title %}OpsCenter · LogLM{% endblock %}
+
+{% block content %}
+<div class="ops-header">
+  <div>
+    <h1 style="margin:0">OpsCenter</h1>
+    <p class="text-muted" style="font-size:.8rem;margin-top:.25rem;">
+      Operational command centre — real-time health, silences, and activity feed
+    </p>
+  </div>
+  <div style="display:flex;align-items:center;gap:.75rem;">
+    {% if pending_hitl > 0 %}
+    <a href="/hitl" class="ops-badge ops-badge-warn">
+      ⏳ {{ pending_hitl }} pending approval{{ 's' if pending_hitl != 1 }}
+    </a>
+    {% endif %}
+    <div class="ops-score ops-score-{{ health.status }}" id="health-score"
+         title="Composite health score (100 = perfect)">
+      {{ health.score }}
+    </div>
+    <span class="ops-status-label ops-status-{{ health.status }}" id="health-status">
+      {{ health.status | upper }}
+    </span>
+    <button class="btn ghost" style="font-size:.75rem" onclick="refreshHealth()">↻ Refresh</button>
+  </div>
+</div>
+
+<!-- ── Health grid ──────────────────────────────────────────────────────── -->
+<div class="ops-kpi-grid">
+  <div class="ops-kpi {% if health.critical_alerts > 0 %}ops-kpi-crit{% elif health.active_alerts > 0 %}ops-kpi-warn{% endif %}">
+    <span class="ops-kpi-value" id="kpi-active-alerts">{{ health.active_alerts }}</span>
+    <span class="ops-kpi-label">Active Alerts</span>
+    {% if health.critical_alerts > 0 %}
+    <span class="ops-kpi-sub" style="color:var(--err)">{{ health.critical_alerts }} critical</span>
+    {% endif %}
+  </div>
+  <div class="ops-kpi">
+    <span class="ops-kpi-value" id="kpi-events-1h">{{ health.events_1h }}</span>
+    <span class="ops-kpi-label">Events (1h)</span>
+    <span class="ops-kpi-sub" id="kpi-errors-1h">{{ health.errors_1h }} errors</span>
+  </div>
+  <div class="ops-kpi {% if health.active_silences > 0 %}ops-kpi-info{% endif %}">
+    <span class="ops-kpi-value" id="kpi-silences">{{ health.active_silences }}</span>
+    <span class="ops-kpi-label">Active Silences</span>
+  </div>
+  <div class="ops-kpi {% if health.pending_hitl > 0 %}ops-kpi-warn{% endif %}">
+    <a href="/hitl" style="text-decoration:none;color:inherit;">
+      <span class="ops-kpi-value" id="kpi-hitl">{{ health.pending_hitl }}</span>
+      <span class="ops-kpi-label">Pending HITL</span>
+    </a>
+  </div>
+</div>
+
+<!-- ── Component health ─────────────────────────────────────────────────── -->
+<div class="card" style="margin-bottom:1rem;">
+  <div class="section-header"><h2>Component Health</h2></div>
+  <div id="component-grid" class="ops-component-grid">
+    {% for c in health.components %}
+    <div class="ops-component ops-component-{{ c.status }}">
+      <span class="ops-component-name">{{ c.name }}</span>
+      <span class="ops-component-status">{{ c.status }}</span>
+      {% if c.latency_ms is not none %}
+      <span class="ops-component-latency">{{ c.latency_ms }}ms</span>
+      {% endif %}
+      <span class="ops-component-detail">{{ c.detail }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  <div style="font-size:.72rem;color:var(--text-muted);margin-top:.5rem;" id="health-checked-at">
+    Last checked: {{ health.checked_at[:19] }} UTC
+  </div>
+</div>
+
+<!-- ── Split: Silences | Activity feed ──────────────────────────────────── -->
+<div style="display:grid;grid-template-columns:1fr 1.4fr;gap:1rem;align-items:start;">
+
+  <!-- Active silences -->
+  <div class="card">
+    <div class="section-header">
+      <h2>Active Silences</h2>
+      <button class="btn ghost" style="font-size:.72rem" onclick="openSilenceModal()">+ Add Silence</button>
+    </div>
+    <div id="silences-list">
+      {% if silences %}
+        {% for s in silences %}
+        <div class="ops-silence" id="silence-{{ s.id }}">
+          <div class="ops-silence-scope">
+            {% if s.host %}<span class="badge badge-low">host: {{ s.host }}</span>{% endif %}
+            {% if s.category %}<span class="badge badge-medium">cat: {{ s.category }}</span>{% endif %}
+            {% if s.severity_filter %}<span class="badge badge-high">sev: {{ s.severity_filter }}</span>{% endif %}
+            {% if not s.host and not s.category and not s.severity_filter %}
+            <span class="badge">global</span>
+            {% endif %}
+          </div>
+          <div class="ops-silence-reason">{{ s.reason }}</div>
+          <div class="ops-silence-meta">
+            by {{ s.created_by }} ·
+            expires <span class="ops-expiry" data-ts="{{ s.expires_at }}"></span>
+          </div>
+          <button class="btn ghost" style="font-size:.7rem;margin-top:.3rem;"
+                  onclick="revokeSilence('{{ s.id }}', this)">Revoke</button>
+        </div>
+        {% endfor %}
+      {% else %}
+        <p class="text-muted" style="font-size:.82rem;">No active silences.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Real-time activity feed -->
+  <div class="card" style="max-height:520px;overflow-y:auto;">
+    <div class="section-header">
+      <h2>Activity Feed <span id="feed-live" style="font-size:.65rem;color:var(--ok);">● LIVE</span></h2>
+    </div>
+    <div id="activity-feed">
+      {% for a in activity %}
+      <div class="ops-activity ops-activity-{{ a.severity }}">
+        <span class="ops-activity-ts">{{ a.timestamp.strftime('%H:%M:%S') if a.timestamp else '' }}</span>
+        <span class="ops-activity-src ops-src-{{ a.source }}">{{ a.source }}</span>
+        <span class="ops-activity-title">
+          {% if a.link %}<a href="{{ a.link }}" style="color:inherit">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}
+        </span>
+        {% if a.detail %}<span class="ops-activity-detail">{{ a.detail }}</span>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<!-- ── Silence creation modal ────────────────────────────────────────────── -->
+<div id="silence-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);
+     z-index:200;align-items:center;justify-content:center;">
+  <div class="card" style="min-width:380px;max-width:480px;padding:1.5rem;">
+    <h2 style="margin-bottom:1rem;">Create Monitoring Silence</h2>
+    <div style="display:flex;flex-direction:column;gap:.6rem;">
+      <label style="font-size:.82rem;color:var(--text-muted);">Scope (at least one)
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;margin-top:.25rem;">
+          <input id="sil-host"     type="text" placeholder="host (optional)">
+          <input id="sil-category" type="text" placeholder="category">
+          <input id="sil-severity" type="text" placeholder="severity">
+        </div>
+      </label>
+      <label style="font-size:.82rem;color:var(--text-muted);">Reason
+        <input id="sil-reason" type="text" placeholder="maintenance, investigation…" style="width:100%">
+      </label>
+      <label style="font-size:.82rem;color:var(--text-muted);">Duration
+        <select id="sil-duration" style="width:100%">
+          <option value="15">15 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="60" selected>1 hour</option>
+          <option value="120">2 hours</option>
+          <option value="240">4 hours</option>
+          <option value="480">8 hours</option>
+          <option value="1440">24 hours</option>
+        </select>
+      </label>
+    </div>
+    <div style="display:flex;gap:.5rem;margin-top:1rem;">
+      <button class="btn" onclick="createSilence()">Create Silence</button>
+      <button class="btn ghost" onclick="closeSilenceModal()">Cancel</button>
+    </div>
+    <div id="sil-error" style="font-size:.8rem;color:var(--err);margin-top:.5rem;"></div>
+  </div>
+</div>
+
+<style>
+.ops-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: .75rem; margin-bottom: 1.25rem;
+}
+.ops-score {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.2rem; font-weight: 700; border: 3px solid;
+  flex-shrink: 0;
+}
+.ops-score-ok       { border-color: var(--ok);  color: var(--ok); }
+.ops-score-degraded { border-color: var(--warn); color: var(--warn); }
+.ops-score-critical { border-color: var(--err);  color: var(--err); }
+
+.ops-status-label   { font-size: .8rem; font-weight: 600; letter-spacing:.08em; }
+.ops-status-ok       { color: var(--ok); }
+.ops-status-degraded { color: var(--warn); }
+.ops-status-critical { color: var(--err); }
+
+.ops-badge         { padding: .25rem .65rem; border-radius: 4px; font-size:.78rem; font-weight:600; text-decoration:none; }
+.ops-badge-warn    { background: rgba(245,166,35,.15); color: var(--warn); border: 1px solid rgba(245,166,35,.3); }
+
+.ops-kpi-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; margin-bottom: 1rem;
+}
+.ops-kpi {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  padding: .9rem 1rem; display: flex; flex-direction: column; gap: .15rem;
+}
+.ops-kpi-crit { border-color: var(--err); }
+.ops-kpi-warn { border-color: var(--warn); }
+.ops-kpi-info { border-color: var(--info); }
+.ops-kpi-value { font-size: 1.8rem; font-weight: 700; line-height: 1; }
+.ops-kpi-label { font-size: .72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing:.06em; }
+.ops-kpi-sub   { font-size: .7rem; color: var(--text-muted); }
+
+.ops-component-grid { display: flex; flex-direction: column; gap: .4rem; }
+.ops-component {
+  display: grid; grid-template-columns: 1fr auto auto 2fr; align-items: center;
+  gap: .5rem; padding: .4rem .6rem; border-radius: 4px;
+  background: var(--bg); border-left: 3px solid transparent; font-size: .8rem;
+}
+.ops-component-ok       { border-left-color: var(--ok); }
+.ops-component-degraded { border-left-color: var(--warn); background: rgba(245,166,35,.04); }
+.ops-component-critical { border-left-color: var(--err); background: rgba(240,79,89,.05); }
+.ops-component-unknown  { border-left-color: var(--text-muted); }
+.ops-component-name     { font-weight: 600; }
+.ops-component-status   { font-size: .7rem; text-transform: uppercase; letter-spacing:.05em; }
+.ops-component-latency  { font-size: .7rem; color: var(--text-muted); font-family: monospace; }
+.ops-component-detail   { font-size: .72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.ops-silence { border-bottom: 1px solid var(--border); padding: .5rem 0; }
+.ops-silence:last-child { border-bottom: none; }
+.ops-silence-scope  { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: .2rem; }
+.ops-silence-reason { font-size: .82rem; }
+.ops-silence-meta   { font-size: .72rem; color: var(--text-muted); }
+
+.ops-activity {
+  display: grid; grid-template-columns: 4rem 3rem 1fr; gap: .5rem;
+  align-items: start; padding: .35rem 0; border-bottom: 1px solid var(--border);
+  font-size: .78rem;
+}
+.ops-activity:last-child { border-bottom: none; }
+.ops-activity-ts     { font-family: monospace; font-size: .72rem; color: var(--text-muted); flex-shrink: 0; }
+.ops-activity-src    { font-size: .65rem; text-transform: uppercase; letter-spacing:.05em; padding: 2px 4px; border-radius: 3px; white-space: nowrap; height: fit-content; }
+.ops-src-llm    { background: rgba(108,142,247,.15); color: var(--accent); }
+.ops-src-user   { background: rgba(61,214,140,.1);  color: var(--ok); }
+.ops-src-system { background: rgba(124,130,160,.1); color: var(--text-muted); }
+.ops-src-monitor{ background: rgba(91,192,222,.1);  color: var(--info); }
+.ops-activity-title  { font-weight: 500; }
+.ops-activity-detail { font-size: .72rem; color: var(--text-muted); grid-column: 3; margin-top: -.1rem; }
+.ops-activity-critical { }
+.ops-activity-warning  { border-left: 2px solid var(--warn); padding-left: .35rem; }
+.ops-activity-info     { }
+</style>
+
+<script>
+// ── Relative-time countdown for silence expiry ──────────────────────────────
+function formatExpiry(ts) {
+  const d = new Date(ts);
+  const diffS = Math.round((d - Date.now()) / 1000);
+  if (diffS <= 0) return 'expired';
+  if (diffS < 60) return `${diffS}s`;
+  if (diffS < 3600) return `${Math.round(diffS/60)}m`;
+  return `${(diffS/3600).toFixed(1)}h`;
+}
+function updateExpiries() {
+  document.querySelectorAll('.ops-expiry').forEach(el => {
+    el.textContent = formatExpiry(el.dataset.ts);
+  });
+}
+updateExpiries();
+setInterval(updateExpiries, 15000);
+
+// ── Health auto-refresh (every 30s) ─────────────────────────────────────────
+async function refreshHealth() {
+  try {
+    const r = await fetch('/api/opscenter/health');
+    if (!r.ok) return;
+    const h = await r.json();
+    document.getElementById('health-score').textContent = h.score;
+    document.getElementById('health-score').className =
+      `ops-score ops-score-${h.status}`;
+    document.getElementById('health-status').textContent = h.status.toUpperCase();
+    document.getElementById('health-status').className =
+      `ops-status-label ops-status-${h.status}`;
+    document.getElementById('kpi-active-alerts').textContent = h.active_alerts;
+    document.getElementById('kpi-events-1h').textContent    = h.events_1h;
+    document.getElementById('kpi-errors-1h').textContent    = h.errors_1h + ' errors';
+    document.getElementById('kpi-silences').textContent     = h.active_silences;
+    document.getElementById('kpi-hitl').textContent         = h.pending_hitl;
+    document.getElementById('health-checked-at').textContent =
+      'Last checked: ' + h.checked_at.slice(0,19) + ' UTC';
+    // Components
+    const grid = document.getElementById('component-grid');
+    grid.innerHTML = h.components.map(c =>
+      `<div class="ops-component ops-component-${c.status}">` +
+      `<span class="ops-component-name">${esc(c.name)}</span>` +
+      `<span class="ops-component-status">${c.status}</span>` +
+      (c.latency_ms !== null ? `<span class="ops-component-latency">${c.latency_ms}ms</span>` : '<span></span>') +
+      `<span class="ops-component-detail">${esc(c.detail)}</span></div>`
+    ).join('');
+  } catch(e) { /* ignore */ }
+}
+setInterval(refreshHealth, 30000);
+
+// ── Live activity feed via SSE ───────────────────────────────────────────────
+const feed = document.getElementById('activity-feed');
+const feedLive = document.getElementById('feed-live');
+const evtSrc = new EventSource('/api/opscenter/activity/stream');
+evtSrc.onopen = () => { feedLive.style.color = 'var(--ok)'; };
+evtSrc.onerror = () => { feedLive.style.color = 'var(--err)'; };
+evtSrc.onmessage = (e) => {
+  if (!e.data || e.data === ': keepalive') return;
+  try {
+    const a = JSON.parse(e.data);
+    const el = document.createElement('div');
+    el.className = `ops-activity ops-activity-${a.severity || 'info'}`;
+    const ts = a.timestamp ? new Date(a.timestamp).toTimeString().slice(0,8) : '--:--:--';
+    el.innerHTML =
+      `<span class="ops-activity-ts">${ts}</span>` +
+      `<span class="ops-activity-src ops-src-${esc(a.source || 'system')}">${esc(a.source||'sys')}</span>` +
+      `<span class="ops-activity-title">${a.link ? `<a href="${esc(a.link)}" style="color:inherit">${esc(a.title)}</a>` : esc(a.title)}</span>` +
+      (a.detail ? `<span class="ops-activity-detail">${esc(a.detail)}</span>` : '');
+    feed.insertBefore(el, feed.firstChild);
+    // Trim to max 80 entries to prevent DOM bloat
+    while (feed.children.length > 80) feed.removeChild(feed.lastChild);
+  } catch {}
+};
+
+// ── Silence modal ─────────────────────────────────────────────────────────────
+function openSilenceModal() {
+  document.getElementById('silence-modal').style.display = 'flex';
+}
+function closeSilenceModal() {
+  document.getElementById('silence-modal').style.display = 'none';
+  document.getElementById('sil-error').textContent = '';
+}
+
+async function createSilence() {
+  const host     = document.getElementById('sil-host').value.trim() || null;
+  const category = document.getElementById('sil-category').value.trim() || null;
+  const severity = document.getElementById('sil-severity').value.trim() || null;
+  const reason   = document.getElementById('sil-reason').value.trim();
+  const duration = parseInt(document.getElementById('sil-duration').value, 10);
+  const errEl    = document.getElementById('sil-error');
+  if (!reason) { errEl.textContent = 'Reason is required'; return; }
+  if (!host && !category && !severity) {
+    errEl.textContent = 'At least one scope (host, category, or severity) is required';
+    return;
+  }
+  try {
+    const r = await fetch('/api/silences', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ host, category, severity_filter: severity,
+                             reason, duration_minutes: duration }),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || 'Error ' + r.status; return; }
+    closeSilenceModal();
+    location.reload();
+  } catch(e) { errEl.textContent = String(e); }
+}
+
+async function revokeSilence(id, btn) {
+  if (!confirm('Revoke this silence? Monitoring will resume immediately.')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/silences/${id}`, { method: 'DELETE' });
+    if (r.ok) {
+      document.getElementById(`silence-${id}`)?.remove();
+      await refreshHealth();
+    } else {
+      btn.disabled = false;
+      alert('Revoke failed');
+    }
+  } catch { btn.disabled = false; }
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+{% endblock %}

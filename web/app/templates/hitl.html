@@ -1,0 +1,291 @@
+{% extends "base.html" %}
+{% block title %}HITL Actions · LogLM{% endblock %}
+
+{% block content %}
+<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1.25rem;flex-wrap:wrap;">
+  <div>
+    <h1 style="margin:0;">Human-in-the-Loop Actions</h1>
+    <p class="text-muted" style="font-size:.82rem;margin-top:.25rem;">
+      All LLM-proposed state changes require explicit admin approval before execution.
+    </p>
+  </div>
+  <div style="display:flex;align-items:center;gap:.5rem;">
+    <span class="text-muted" style="font-size:.78rem;" id="live-label">● LIVE</span>
+    <button class="btn ghost" style="font-size:.75rem;" onclick="loadActions()">↻ Refresh</button>
+  </div>
+</div>
+
+{% if not can_approve %}
+<div class="card" style="border-left:3px solid var(--warn);margin-bottom:1rem;">
+  <p class="text-muted" style="font-size:.82rem;margin:0;">
+    ⚠ You have <strong>operator</strong> role — you can propose actions but only
+    <strong>admins</strong> can approve or reject them.
+  </p>
+</div>
+{% endif %}
+
+<!-- Filter bar -->
+<div style="display:flex;gap:.5rem;margin-bottom:.75rem;align-items:center;flex-wrap:wrap;">
+  <select id="filter-status" onchange="loadActions()" style="font-size:.8rem;">
+    <option value="pending">Pending</option>
+    <option value="approved">Approved</option>
+    <option value="rejected">Rejected</option>
+    <option value="executed">Executed</option>
+    <option value="expired">Expired</option>
+    <option value="">All</option>
+  </select>
+  <span class="text-muted" style="font-size:.78rem;" id="action-count"></span>
+</div>
+
+<div id="actions-list"></div>
+
+<!-- Risk-level approval modal -->
+<div id="approve-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-box">
+    <input type="hidden" id="approve-action-id">
+    <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1rem;">
+      <div id="approve-risk-icon" style="font-size:2rem;"></div>
+      <div>
+        <h2 style="margin:0;" id="approve-title">Confirm Approval</h2>
+        <p class="text-muted" style="font-size:.8rem;margin:0;" id="approve-risk-label"></p>
+      </div>
+    </div>
+    <div id="approve-desc" style="font-size:.85rem;margin-bottom:1rem;"></div>
+    <div id="approve-payload"
+         style="background:var(--bg);padding:.6rem;border-radius:4px;font-size:.75rem;
+                font-family:monospace;white-space:pre-wrap;margin-bottom:1rem;
+                max-height:200px;overflow-y:auto;"></div>
+    <p style="font-size:.85rem;color:var(--warn);margin-bottom:1rem;">
+      ⚠ This action will execute immediately upon approval and be recorded in the immutable audit log.
+    </p>
+    <div style="display:flex;gap:.5rem;">
+      <button class="btn" style="background:var(--ok);" onclick="executeApprove()">✓ Approve &amp; Execute</button>
+      <button class="btn ghost" onclick="closeModal('approve-modal')">Cancel</button>
+    </div>
+    <div class="modal-error" id="approve-error"></div>
+  </div>
+</div>
+
+<!-- Reject modal -->
+<div id="reject-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-box">
+    <input type="hidden" id="reject-action-id">
+    <h2 style="margin-bottom:.75rem;">Reject Action</h2>
+    <p id="reject-title-preview" class="text-muted" style="font-size:.82rem;margin-bottom:.75rem;"></p>
+    <label style="font-size:.82rem;color:var(--text-muted);">Reason (shown to requester)
+      <textarea id="reject-reason" rows="3" style="width:100%;background:var(--bg);
+        border:1px solid var(--border);border-radius:4px;color:var(--text);
+        padding:.35rem .5rem;font-size:.82rem;margin-top:.25rem;resize:vertical;"></textarea>
+    </label>
+    <div style="display:flex;gap:.5rem;margin-top:.75rem;">
+      <button class="btn" style="background:var(--err);" onclick="executeReject()">✕ Reject</button>
+      <button class="btn ghost" onclick="closeModal('reject-modal')">Cancel</button>
+    </div>
+    <div class="modal-error" id="reject-error"></div>
+  </div>
+</div>
+
+<style>
+.hitl-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 1rem 1.1rem; margin-bottom: .65rem;
+  border-left: 4px solid transparent; transition: border-color .2s;
+}
+.hitl-card-pending.risk-low      { border-left-color: #3dd68c; }
+.hitl-card-pending.risk-medium   { border-left-color: var(--warn); }
+.hitl-card-pending.risk-high     { border-left-color: #ff8c00; }
+.hitl-card-pending.risk-critical { border-left-color: var(--err); animation: pulse-border 1.5s infinite; }
+.hitl-card-executed { border-left-color: var(--ok);        opacity: .75; }
+.hitl-card-rejected { border-left-color: var(--err);       opacity: .65; }
+.hitl-card-expired  { border-left-color: var(--text-muted);opacity: .55; }
+@keyframes pulse-border {
+  0%,100% { border-left-color: var(--err); }
+  50%      { border-left-color: rgba(240,79,89,.3); }
+}
+.hitl-header { display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.4rem; }
+.hitl-title  { font-weight:600;font-size:.9rem;flex:1; }
+.hitl-meta   { font-size:.75rem;color:var(--text-muted);display:flex;gap:.75rem;flex-wrap:wrap; }
+.hitl-desc   { font-size:.82rem;margin:.4rem 0; }
+.hitl-payload {
+  background: var(--bg); border-radius: 4px; padding: .4rem .6rem;
+  font-size: .72rem; font-family: monospace; white-space: pre-wrap;
+  max-height: 120px; overflow-y: auto; margin: .4rem 0; color: var(--text-muted);
+}
+.hitl-actions { display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.6rem; }
+.risk-badge {
+  font-size:.68rem;font-weight:600;padding:2px 7px;border-radius:3px;text-transform:uppercase;
+  letter-spacing:.05em;
+}
+.risk-badge.risk-low      { background:rgba(61,214,140,.15);color:#3dd68c; }
+.risk-badge.risk-medium   { background:rgba(245,166,35,.15); color:var(--warn); }
+.risk-badge.risk-high     { background:rgba(255,140,0,.15);  color:#ff8c00; }
+.risk-badge.risk-critical { background:rgba(240,79,89,.15);  color:var(--err); }
+.status-badge { font-size:.7rem;font-weight:600;padding:2px 6px;border-radius:3px; }
+.status-pending  { background:rgba(108,142,247,.15);color:var(--accent); }
+.status-approved,.status-executed { background:rgba(61,214,140,.15);color:var(--ok); }
+.status-rejected { background:rgba(240,79,89,.15);color:var(--err); }
+.status-expired  { background:rgba(124,130,160,.1);color:var(--text-muted); }
+.modal-overlay { position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;
+  display:flex;align-items:center;justify-content:center; }
+.modal-box { background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+  padding:1.5rem;min-width:400px;max-width:560px;width:100%; }
+.modal-error { font-size:.78rem;color:var(--err);margin-top:.4rem;min-height:1em; }
+</style>
+
+<script>
+const CAN_APPROVE = {{ 'true' if can_approve else 'false' }};
+const RISK_ICONS = { low:'🟢', medium:'🟡', high:'🟠', critical:'🔴' };
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmt(s) {
+  if (!s) return '—';
+  return new Date(s).toLocaleString();
+}
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+function relTime(s) {
+  if (!s) return '';
+  const d = new Date(s), now = Date.now();
+  const diffS = Math.round((d - now)/1000);
+  if (diffS <= 0) return 'expired';
+  if (diffS < 60) return `${diffS}s`;
+  if (diffS < 3600) return `${Math.round(diffS/60)}m`;
+  return `${(diffS/3600).toFixed(1)}h`;
+}
+
+// ── Load & render actions ────────────────────────────────────────────────────
+async function loadActions() {
+  const status = document.getElementById('filter-status').value;
+  const mount  = document.getElementById('actions-list');
+  mount.innerHTML = '<p class="text-muted" style="font-size:.82rem;">Loading…</p>';
+  try {
+    const qs = status ? `?status=${status}&limit=100` : '?limit=100';
+    const r  = await fetch('/api/hitl' + qs);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const rows = data.actions || data;
+    document.getElementById('action-count').textContent = `${rows.length} action${rows.length!==1?'s':''}`;
+    if (!rows.length) {
+      mount.innerHTML = '<p class="text-muted" style="font-size:.82rem;">No actions found.</p>';
+      return;
+    }
+    mount.innerHTML = rows.map(row => renderCard(row)).join('');
+  } catch(e) {
+    mount.innerHTML = `<p style="color:var(--err)">Error: ${esc(String(e))}</p>`;
+  }
+}
+
+function renderCard(r) {
+  const payload = typeof r.payload === 'object' ? JSON.stringify(r.payload, null, 2) : r.payload;
+  const isPending = r.status === 'pending';
+  const approvalBtns = CAN_APPROVE && isPending
+    ? `<button class="btn" style="font-size:.75rem;background:var(--ok);"
+           onclick="openApproveModal('${r.id}','${esc(r.action_title)}',this)">✓ Approve</button>
+       <button class="btn ghost" style="font-size:.75rem;color:var(--err);"
+           onclick="openRejectModal('${r.id}','${esc(r.action_title)}')">✕ Reject</button>`
+    : '';
+  const expiryStr = isPending && r.expires_at
+    ? `<span>expires in ${relTime(r.expires_at)}</span>` : '';
+  return `<div class="hitl-card hitl-card-${r.status} risk-${r.risk_level}">
+    <div class="hitl-header">
+      <span class="risk-badge risk-${r.risk_level}">${r.risk_level}</span>
+      <span class="hitl-title">${esc(r.action_title)}</span>
+      <span class="status-badge status-${r.status}">${r.status}</span>
+    </div>
+    <div class="hitl-meta">
+      <span>type: <code>${esc(r.action_type)}</code></span>
+      <span>requested by <strong>${esc(r.requested_by)}</strong> at ${fmt(r.created_at)}</span>
+      ${expiryStr}
+      ${r.reviewed_by ? `<span>${r.status} by ${esc(r.reviewed_by)} at ${fmt(r.reviewed_at)}</span>` : ''}
+      ${r.rejection_reason ? `<span style="color:var(--err)">reason: ${esc(r.rejection_reason)}</span>` : ''}
+    </div>
+    ${r.action_desc ? `<div class="hitl-desc">${esc(r.action_desc)}</div>` : ''}
+    <details>
+      <summary style="font-size:.75rem;cursor:pointer;color:var(--text-muted);margin:.3rem 0;">
+        Payload JSON
+      </summary>
+      <div class="hitl-payload">${esc(payload)}</div>
+    </details>
+    ${r.execution_result ? `<div class="hitl-desc" style="color:var(--ok);font-size:.75rem;">
+      Result: ${esc(JSON.stringify(r.execution_result))}</div>` : ''}
+    <div class="hitl-actions">${approvalBtns}</div>
+  </div>`;
+}
+
+// ── Approve flow ─────────────────────────────────────────────────────────────
+function openApproveModal(actionId, title, btn) {
+  const card = btn.closest('.hitl-card');
+  const risk = [...card.classList].find(c => c.startsWith('risk-'))?.replace('risk-','') || 'medium';
+  document.getElementById('approve-action-id').value = actionId;
+  document.getElementById('approve-title').textContent = `Approve: ${title}`;
+  document.getElementById('approve-risk-label').textContent = `Risk level: ${risk.toUpperCase()}`;
+  document.getElementById('approve-risk-icon').textContent  = RISK_ICONS[risk] || '❓';
+  document.getElementById('approve-desc').textContent = card.querySelector('.hitl-desc')?.textContent || '';
+  document.getElementById('approve-payload').textContent =
+    card.querySelector('.hitl-payload')?.textContent || '';
+  document.getElementById('approve-error').textContent = '';
+  document.getElementById('approve-modal').style.display = 'flex';
+}
+
+async function executeApprove() {
+  const id    = document.getElementById('approve-action-id').value;
+  const errEl = document.getElementById('approve-error');
+  errEl.textContent = 'Approving…';
+  try {
+    const r = await fetch(`/api/hitl/${id}/approve`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || 'Error ' + r.status; return; }
+    closeModal('approve-modal');
+    loadActions();
+  } catch(e) { errEl.textContent = String(e); }
+}
+
+// ── Reject flow ──────────────────────────────────────────────────────────────
+function openRejectModal(actionId, title) {
+  document.getElementById('reject-action-id').value = actionId;
+  document.getElementById('reject-title-preview').textContent = title;
+  document.getElementById('reject-reason').value = '';
+  document.getElementById('reject-error').textContent = '';
+  document.getElementById('reject-modal').style.display = 'flex';
+}
+
+async function executeReject() {
+  const id     = document.getElementById('reject-action-id').value;
+  const reason = document.getElementById('reject-reason').value.trim();
+  const errEl  = document.getElementById('reject-error');
+  try {
+    const r = await fetch(`/api/hitl/${id}/reject`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ reason: reason || null }),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || 'Error ' + r.status; return; }
+    closeModal('reject-modal');
+    loadActions();
+  } catch(e) { errEl.textContent = String(e); }
+}
+
+// ── API endpoint that returns actions with status filter ──────────────────────
+// Redirect: the existing API returns all from DB — we add client-side filtering
+// and a proper GET /api/hitl endpoint.
+
+// ── Live SSE updates ─────────────────────────────────────────────────────────
+const liveLabel = document.getElementById('live-label');
+const es = new EventSource('/api/hitl/stream');
+es.onopen  = () => { liveLabel.style.color = 'var(--ok)'; };
+es.onerror = () => { liveLabel.style.color = 'var(--err)'; };
+es.onmessage = (e) => {
+  try {
+    const d = JSON.parse(e.data);
+    if (['proposed','approved','rejected'].includes(d.event)) {
+      loadActions();
+    }
+  } catch {}
+};
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadActions();
+</script>
+{% endblock %}

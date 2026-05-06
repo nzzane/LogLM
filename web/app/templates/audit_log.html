@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Audit Log · LogLM{% endblock %}
+
+{% block content %}
+<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1.25rem;flex-wrap:wrap;">
+  <div>
+    <h1 style="margin:0;">Immutable Audit Log</h1>
+    <p class="text-muted" style="font-size:.82rem;margin-top:.25rem;">
+      SHA-256 hash chain — every entry is cryptographically linked to the previous. Any tampering is detectable.
+    </p>
+  </div>
+  <div style="display:flex;align-items:center;gap:.6rem;">
+    <button class="btn ghost" style="font-size:.75rem" onclick="verifyChain()" id="verify-btn">
+      🔒 Verify Chain
+    </button>
+    <span id="verify-status"></span>
+  </div>
+</div>
+
+<!-- Integrity banner -->
+<div id="integrity-banner" style="display:none;" class="card integrity-banner">
+  <div id="integrity-msg" style="font-size:.85rem;"></div>
+</div>
+
+<!-- Filter bar -->
+<div style="display:flex;gap:.5rem;margin-bottom:.75rem;flex-wrap:wrap;align-items:center;">
+  <input type="text" id="filter-actor"  placeholder="filter by actor"  style="font-size:.8rem;width:140px">
+  <input type="text" id="filter-action" placeholder="filter by action" style="font-size:.8rem;width:160px">
+  <button class="btn ghost" style="font-size:.8rem" onclick="loadEntries()">Apply</button>
+  <span class="text-muted" style="font-size:.78rem;" id="total-label"></span>
+  <span class="text-muted" style="font-size:.78rem;margin-left:auto;">
+    {{ total | int }} total entries
+  </span>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden;">
+  <table class="audit-table" id="audit-table">
+    <thead>
+      <tr>
+        <th>#</th><th>Timestamp</th><th>Actor</th><th>Method</th>
+        <th>Action</th><th>Target</th><th>Severity</th><th>Hash</th>
+      </tr>
+    </thead>
+    <tbody id="audit-tbody">
+      {% for e in entries %}
+      <tr class="audit-row sev-{{ e.severity }}">
+        <td class="text-muted" style="font-family:monospace;font-size:.72rem;">{{ e.id }}</td>
+        <td style="font-size:.75rem;white-space:nowrap;">
+          {{ e.timestamp.strftime('%Y-%m-%d %H:%M:%S') if e.timestamp else '—' }}
+        </td>
+        <td><strong>{{ e.actor }}</strong></td>
+        <td><span class="method-badge method-{{ e.actor_method }}">{{ e.actor_method }}</span></td>
+        <td><code style="font-size:.78rem;">{{ e.action }}</code></td>
+        <td class="text-muted" style="font-size:.75rem;max-width:180px;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap;" title="{{ e.target or '' }}">
+          {{ e.target or '—' }}
+        </td>
+        <td><span class="sev-badge sev-{{ e.severity }}">{{ e.severity }}</span></td>
+        <td>
+          <span class="hash-preview" title="{{ e.entry_hash }}">{{ e.entry_hash[:12] }}…</span>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Pagination -->
+<div class="pagination" id="pagination" style="margin-top:.75rem;"></div>
+
+<style>
+.audit-table {
+  width: 100%; border-collapse: collapse; font-size: .82rem;
+}
+.audit-table th {
+  background: var(--bg); padding: .45rem .65rem; text-align: left;
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-muted); border-bottom: 1px solid var(--border); position: sticky; top: 0;
+}
+.audit-table td { padding: .4rem .65rem; border-bottom: 1px solid var(--border); }
+.audit-row.sev-warning td { background: rgba(245,166,35,.03); }
+.audit-row.sev-critical td { background: rgba(240,79,89,.04); }
+.audit-row:last-child td { border-bottom: none; }
+
+.method-badge { font-size:.68rem;font-weight:600;padding:2px 6px;border-radius:3px; text-transform:uppercase; }
+.method-session  { background:rgba(61,214,140,.1); color:var(--ok); }
+.method-apikey   { background:rgba(108,142,247,.1);color:var(--accent); }
+.method-llm_hitl { background:rgba(245,166,35,.12);color:var(--warn); }
+.method-system   { background:rgba(124,130,160,.1);color:var(--text-muted); }
+
+.sev-badge { font-size:.68rem;font-weight:600;padding:2px 6px;border-radius:3px; }
+.sev-badge.sev-info     { background:rgba(91,192,222,.1);  color:var(--info); }
+.sev-badge.sev-warning  { background:rgba(245,166,35,.15); color:var(--warn); }
+.sev-badge.sev-critical { background:rgba(240,79,89,.15);  color:var(--err); }
+
+.hash-preview {
+  font-family: monospace; font-size: .7rem; color: var(--text-muted); cursor: help;
+}
+
+.integrity-banner { margin-bottom: .75rem; border-left: 4px solid; }
+.integrity-banner.ok       { border-left-color: var(--ok); }
+.integrity-banner.tampered { border-left-color: var(--err); background: rgba(240,79,89,.05); }
+</style>
+
+<script>
+let currentOffset = 0;
+const PAGE_SIZE = 100;
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadEntries(offset = 0) {
+  currentOffset = offset;
+  const actor  = document.getElementById('filter-actor').value.trim();
+  const action = document.getElementById('filter-action').value.trim();
+  const qs = new URLSearchParams({ limit: PAGE_SIZE, offset });
+  if (actor)  qs.set('actor', actor);
+  if (action) qs.set('action', action);
+  try {
+    const r = await fetch(`/api/audit?${qs}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    renderEntries(d.entries, d.total);
+  } catch(e) {
+    document.getElementById('audit-tbody').innerHTML =
+      `<tr><td colspan="8" style="color:var(--err)">Error: ${esc(String(e))}</td></tr>`;
+  }
+}
+
+function renderEntries(entries, total) {
+  document.getElementById('total-label').textContent = `${total} total entries`;
+  const tbody = document.getElementById('audit-tbody');
+  if (!entries.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="text-muted">No entries match the filter.</td></tr>';
+  } else {
+    tbody.innerHTML = entries.map(e => `<tr class="audit-row sev-${esc(e.severity)}">
+      <td class="text-muted" style="font-family:monospace;font-size:.72rem;">${e.id}</td>
+      <td style="font-size:.75rem;white-space:nowrap;">${esc((e.timestamp||'').slice(0,19).replace('T', ' '))}</td>
+      <td><strong>${esc(e.actor)}</strong></td>
+      <td><span class="method-badge method-${esc(e.actor_method||'system')}">${esc(e.actor_method||'system')}</span></td>
+      <td><code style="font-size:.78rem;">${esc(e.action)}</code></td>
+      <td class="text-muted" style="font-size:.75rem;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+          title="${esc(e.target||'')}">
+        ${esc(e.target||'—')}
+      </td>
+      <td><span class="sev-badge sev-${esc(e.severity)}">${esc(e.severity)}</span></td>
+      <td><span class="hash-preview" title="${esc(e.entry_hash||'')}">
+        ${esc((e.entry_hash||'').slice(0,12))}…
+      </span></td>
+    </tr>`).join('');
+  }
+
+  // Pagination
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const curPage = Math.floor(currentOffset / PAGE_SIZE);
+  const pag = document.getElementById('pagination');
+  if (pages <= 1) { pag.innerHTML = ''; return; }
+  let html = '';
+  if (curPage > 0) html += `<a href="javascript:loadEntries(${(curPage-1)*PAGE_SIZE})">← Prev</a> `;
+  for (let p = Math.max(0, curPage-3); p < Math.min(pages, curPage+4); p++) {
+    html += p === curPage
+      ? `<span class="current">${p+1}</span> `
+      : `<a href="javascript:loadEntries(${p*PAGE_SIZE})">${p+1}</a> `;
+  }
+  if (curPage < pages-1) html += `<a href="javascript:loadEntries(${(curPage+1)*PAGE_SIZE})">Next →</a>`;
+  pag.innerHTML = html;
+}
+
+// ── Chain integrity verification ─────────────────────────────────────────────
+async function verifyChain() {
+  const btn = document.getElementById('verify-btn');
+  const statusEl = document.getElementById('verify-status');
+  const banner = document.getElementById('integrity-banner');
+  const msg    = document.getElementById('integrity-msg');
+  btn.disabled = true;
+  btn.textContent = '⏳ Verifying…';
+  statusEl.textContent = '';
+  try {
+    const r = await fetch('/api/audit/verify');
+    const d = await r.json();
+    banner.style.display = 'block';
+    if (d.ok) {
+      banner.className = 'card integrity-banner ok';
+      msg.innerHTML = `<span style="color:var(--ok)">✓ Chain integrity verified</span> — 
+        ${d.entries} entries, all hashes match. No tampering detected.`;
+      btn.textContent = '✓ Chain OK';
+      statusEl.style.color = 'var(--ok)';
+      statusEl.textContent = 'verified';
+    } else {
+      banner.className = 'card integrity-banner tampered';
+      msg.innerHTML = `<span style="color:var(--err)">⚠ CHAIN INTEGRITY FAILURE</span> — 
+        Tampered entry detected at ID <strong>${d.broken_at_id}</strong>
+        (actor: ${esc(d.broken_at_actor)}, action: ${esc(d.broken_at_action)}).
+        ${esc(d.error)}`;
+      btn.textContent = '⚠ Tampering Detected';
+      statusEl.style.color = 'var(--err)';
+      statusEl.textContent = 'VIOLATION';
+    }
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e;
+    btn.textContent = '🔒 Verify Chain';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Filter on Enter ─────────────────────────────────────────────────────────
+['filter-actor','filter-action'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') loadEntries();
+  });
+});
+</script>
+{% endblock %}
