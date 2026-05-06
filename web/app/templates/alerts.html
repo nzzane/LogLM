@@ -59,7 +59,7 @@
   <div class="alert-card {{ alert.severity }} {% if alert.acknowledged %}acked{% endif %} {% if alert.user_verdict == 'important' %}verdict-important{% elif alert.user_verdict == 'ignored' %}verdict-ignored{% endif %}"
        data-alert-id="{{ alert.id }}"
        data-cooldown="{{ alert.cooldown_key or '' }}"
-       data-category="{{ alert.raw_result.get('category', '') if alert.raw_result else '' }}">
+        data-category="{{ alert.raw_result.get('category', '') if alert.raw_result is mapping else '' }}">
 
     <div class="alert-header">
       <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>

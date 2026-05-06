@@ -38,6 +38,33 @@
   </main>
 
   <script src="/static/js/app.js"></script>
+
+  <script>
+  // ── Global CSRF fetch interceptor ─────────────────────────────────────────
+  // auth.py issues a loglm_csrf cookie (httponly=false) on login.
+  // Every mutating request (POST/PUT/PATCH/DELETE) must echo it back as the
+  // x-csrf-token header so csrf_guard() accepts it.
+  // Wrapping window.fetch here means every page gets CSRF for free — no
+  // per-template boilerplate needed.
+  (function () {
+    const _real = window.fetch.bind(window);
+    window.fetch = function (url, opts) {
+      opts = opts || {};
+      const method = (opts.method || 'GET').toUpperCase();
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+        const m = document.cookie.match(/(?:^|;\s*)loglm_csrf=([^;]+)/);
+        if (m) {
+          opts.headers = Object.assign(
+            { 'x-csrf-token': decodeURIComponent(m[1]) },
+            opts.headers || {}
+          );
+        }
+      }
+      return _real(url, opts);
+    };
+  })();
+  </script>
+
   {% block scripts %}{% endblock %}
   <script>
   // Highlight active nav link

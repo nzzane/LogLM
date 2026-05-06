@@ -968,9 +968,26 @@ async def alert_history(
             total = await conn.fetchval(
                 "SELECT COUNT(*) FROM alerts WHERE (user_verdict IS NULL OR user_verdict != 'ignored')"
             )
+    def _normalise_alert(row) -> dict:
+        """asyncpg returns JSONB columns as Python dicts for JSON objects,
+        but as plain str for rows where raw_result was stored as a JSON
+        string value rather than a JSON object (can happen with old rows).
+        Normalise to dict so the template can safely call .get()."""
+        d = dict(row)
+        rr = d.get("raw_result")
+        if isinstance(rr, str):
+            try:
+                parsed = json.loads(rr)
+                d["raw_result"] = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                d["raw_result"] = {}
+        elif rr is None:
+            d["raw_result"] = {}
+        return d
+
     return templates.TemplateResponse("alerts.html", {
         "request":      request,
-        "alerts":       [dict(r) for r in rows],
+        "alerts":       [_normalise_alert(r) for r in rows],
         "page":         page,
         "total":        total,
         "limit":        limit,
