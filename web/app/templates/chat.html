@@ -158,6 +158,26 @@
 .chat-msg.user .chat-msg-header { text-align: right; }
 .chat-msg-body { white-space: pre-wrap; word-break: break-word; }
 
+/* HITL action proposal card — shown inline after LLM detects actionable intent */
+.hitl-proposal-card {
+  align-self: flex-start;
+  background: var(--bg2);
+  border: 1px solid #f5a623;
+  border-left: 4px solid #f5a623;
+  border-radius: 8px;
+  padding: .85rem 1rem;
+  font-size: .85rem;
+  max-width: 80%;
+}
+.hitl-card-header {
+  display: flex; align-items: center; gap: .5rem;
+  font-size: .8rem; margin-bottom: .4rem;
+}
+.hitl-risk { font-size: .7rem; font-weight: 700; letter-spacing: .05em; margin-left: auto; }
+.hitl-card-title { font-weight: 600; margin-bottom: .25rem; }
+.hitl-card-desc  { color: var(--text-muted); font-size: .8rem; margin-bottom: .6rem; }
+.hitl-card-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
+
 .chat-input-area {
   padding: .75rem 1.5rem;
   border-top: 1px solid var(--border);
@@ -394,6 +414,7 @@ async function sendMessage(e) {
       }
 
       appendMessage('assistant', data.response || 'No response', data.mode || sendMode);
+      if (data.hitl_proposal) appendHitlCard(data.hitl_proposal);
     } catch (err) {
       removeTyping();
       appendMessage('assistant', 'Error communicating with server: ' + err.message, sendMode);
@@ -402,6 +423,82 @@ async function sendMessage(e) {
       input.focus();
     }
   }
+}
+
+// ── HITL proposal card ────────────────────────────────────────────────────────
+const RISK_ICON  = { low:'🟢', medium:'🟡', high:'🟠', critical:'🔴' };
+const RISK_COLOR = { low:'#3dd68c', medium:'#f5a623', high:'#ff8c00', critical:'#f04f59' };
+
+function appendHitlCard(proposal) {
+  const container = document.getElementById('chat-messages');
+  const risk  = proposal.risk_level || 'medium';
+  const color = RISK_COLOR[risk] || RISK_COLOR.medium;
+  const icon  = RISK_ICON[risk]  || '⏳';
+  const card  = document.createElement('div');
+  card.className = 'hitl-proposal-card';
+  card.dataset.actionId = proposal.action_id;
+  card.innerHTML = `
+    <div class="hitl-card-header">
+      ${icon} <strong>Action Proposed — pending admin approval</strong>
+      <span class="hitl-risk" style="color:${color};">${risk.toUpperCase()}</span>
+    </div>
+    <div class="hitl-card-title">${escHtml(proposal.action_title)}</div>
+    <div class="hitl-card-desc">${escHtml(proposal.action_desc)}</div>
+    <div class="hitl-card-actions">
+      <a href="/hitl" class="btn" style="font-size:.75rem;">View on HITL page →</a>
+      <button class="btn" style="font-size:.75rem;background:var(--ok);"
+              onclick="approveInline('${escHtml(proposal.action_id)}',this)">
+        ✓ Approve
+      </button>
+      <button class="btn ghost" style="font-size:.75rem;color:var(--err);"
+              onclick="rejectInline('${escHtml(proposal.action_id)}',this)">
+        ✕ Reject
+      </button>
+    </div>
+    <div class="hitl-card-status" style="font-size:.75rem;color:var(--text-muted);margin-top:.3rem;"></div>
+  `;
+  container.appendChild(card);
+  scrollToBottom();
+}
+
+async function approveInline(actionId, btn) {
+  if (!confirm('Approve and execute this action immediately?')) return;
+  btn.disabled = true;
+  const statusEl = btn.closest('.hitl-proposal-card').querySelector('.hitl-card-status');
+  statusEl.textContent = 'Approving…';
+  try {
+    const r = await fetch(`/api/hitl/${actionId}/approve`, { method: 'POST' });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      statusEl.style.color = 'var(--ok)';
+      statusEl.textContent = '✓ Approved and executed';
+      btn.closest('.hitl-card-actions').querySelectorAll('button').forEach(b => b.disabled = true);
+    } else {
+      statusEl.style.color = 'var(--err)';
+      statusEl.textContent = 'Failed: ' + (d.detail || JSON.stringify(d));
+      btn.disabled = false;
+    }
+  } catch (e) { statusEl.textContent = 'Error: ' + e; btn.disabled = false; }
+}
+
+async function rejectInline(actionId, btn) {
+  const reason = prompt('Reason for rejection (optional):') ?? '';
+  btn.disabled = true;
+  const statusEl = btn.closest('.hitl-proposal-card').querySelector('.hitl-card-status');
+  statusEl.textContent = 'Rejecting…';
+  try {
+    const r = await fetch(`/api/hitl/${actionId}/reject`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ reason: reason || null }),
+    });
+    if (r.ok) {
+      statusEl.style.color = 'var(--text-muted)';
+      statusEl.textContent = '✕ Rejected';
+      btn.closest('.hitl-card-actions').querySelectorAll('button').forEach(b => b.disabled = true);
+    } else {
+      statusEl.textContent = 'Reject failed'; btn.disabled = false;
+    }
+  } catch (e) { statusEl.textContent = 'Error: ' + e; btn.disabled = false; }
 }
 
 function sendSuggestion(text, mode) {

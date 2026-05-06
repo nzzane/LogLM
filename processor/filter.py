@@ -72,6 +72,8 @@ ALWAYS_KEEP: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
 ]]
 
 # ── Patterns that are ALWAYS dropped (pure noise) ──────────────────────────────
+# Keep this list aggressive so expanding the severity threshold to INFO (below)
+# doesn't cause storage bloat from truly useless traffic.
 ALWAYS_DROP: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
     # Health checks / uptime pings
     r'"GET /health',
@@ -128,6 +130,25 @@ ALWAYS_DROP: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in [
     r"unbound.*info: reply from",
     # Python stdlib access-log style INFO
     r'INFO: +\d{1,3}(?:\.\d{1,3}){3}:\d+ - "(?:GET|HEAD) /(?:static|health|livez|readyz|metrics)',
+    # Docker/container daemon chatter (not the workload containers — the runtime itself)
+    r"dockerd.*level=(info|debug)",
+    r"containerd.*Successfully pulled",
+    r"containerd.*Unpacking",
+    r"containerd.*snapshots",
+    r"(moby|dockerd).*clean up.*container",
+    # SNMP polling traffic to the device itself (not OUR poller, but device's own logs)
+    r"snmpd: Connection from UDP: ",
+    # Routine interface statistics counters (high-volume, low-signal on APs/switches)
+    r"ifHCIn(Octets|Pkts|MulticastPkts|BroadcastPkts)",
+    r"ifHCOut(Octets|Pkts|MulticastPkts|BroadcastPkts)",
+    # Kubernetes / container orchestration probe noise
+    r'"GET /readyz? HTTP',
+    r'"GET /livez? HTTP',
+    r"kube-probe",
+    # Generic heartbeat / watchdog ticks
+    r"watchdog.*ok",
+    r"heartbeat.*sent",
+    r"ping.*reply from.*time=",
 ]]
 
 # ── Rate-limited patterns (keep first per window, drop repeats) ────────────────
@@ -261,10 +282,15 @@ def classify(event: dict) -> str:
                     return "store"
             return "keep"
 
-    # 2. ALWAYS_DROP
-    for pattern in ALWAYS_DROP:
-        if pattern.search(msg):
-            return "drop"
+    # 2. ALWAYS_DROP — checked before severity so explicit noise stays silent
+    #    regardless of the source.  Firewall events are excluded from this
+    #    check because dropping a firewall flow loses audit data permanently.
+    struct = event.get("structured") or {}
+    is_firewall = struct.get("type") == "firewall_event"
+    if not is_firewall:
+        for pattern in ALWAYS_DROP:
+            if pattern.search(msg):
+                return "drop"
 
     # 3. High severity (emerg–warning) → keep even without explicit pattern
     if severity_num <= 4:
@@ -279,9 +305,23 @@ def classify(event: dict) -> str:
                 return "drop"
             return "store"  # first occurrence in window: store but don't LLM-analyze
 
-    # 5. Notice → store (visible in UI, not LLM)
+    # 5. Firewall events: always stored for audit trail — never dropped by
+    #    the severity fallback below (high-volume firewalls send at info
+    #    level and still need to be queryable for forensics).
+    if is_firewall:
+        return "store"
+
+    # 6. Notice → store (visible in UI, not LLM)
     if severity_num == 5:
         return "store"
 
-    # 6. Info/debug → drop
+    # 7. Info → store.
+    #    Changed from "drop" to "store" so that Docker container syslogs
+    #    and other INFO-level workload logs are captured in the log browser.
+    #    The extended ALWAYS_DROP list above keeps truly useless chatter out.
+    #    Debug (severity 7) is still dropped to avoid binary/trace noise.
+    if severity_num == 6:
+        return "store"
+
+    # 8. Debug → drop
     return "drop"

@@ -64,13 +64,14 @@ RISK_ORDER = [RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL]
 # ── Supported action types ────────────────────────────────────────────────────
 # Each maps to an executor function registered in _EXECUTORS below.
 
-ACTION_SILENCE_HOST     = "silence_host"
-ACTION_SILENCE_CATEGORY = "silence_category"
-ACTION_SILENCE_SEVERITY = "silence_severity"
-ACTION_ACK_ALERTS       = "acknowledge_alerts"
-ACTION_REVOKE_SILENCE   = "revoke_silence"
-ACTION_SET_SETTING      = "set_setting"
-ACTION_CUSTOM           = "custom"     # free-form, risk=high, no auto-exec
+ACTION_SILENCE_HOST        = "silence_host"
+ACTION_SILENCE_CATEGORY    = "silence_category"
+ACTION_SILENCE_SEVERITY    = "silence_severity"
+ACTION_ACK_ALERTS          = "acknowledge_alerts"
+ACTION_REVOKE_SILENCE      = "revoke_silence"
+ACTION_SET_SETTING         = "set_setting"
+ACTION_CREATE_FEEDBACK_RULE= "create_feedback_rule"  # add ignore/important rules to the filter
+ACTION_CUSTOM              = "custom"     # free-form, risk=high, no auto-exec
 
 # ── Immutable audit chain ─────────────────────────────────────────────────────
 
@@ -191,7 +192,8 @@ async def propose_action(
     """
     if action_type not in (
         ACTION_SILENCE_HOST, ACTION_SILENCE_CATEGORY, ACTION_SILENCE_SEVERITY,
-        ACTION_ACK_ALERTS, ACTION_REVOKE_SILENCE, ACTION_SET_SETTING, ACTION_CUSTOM,
+        ACTION_ACK_ALERTS, ACTION_REVOKE_SILENCE, ACTION_SET_SETTING,
+        ACTION_CREATE_FEEDBACK_RULE, ACTION_CUSTOM,
     ):
         raise ValueError(f"Unknown action_type: {action_type!r}")
 
@@ -390,6 +392,8 @@ async def _execute_action(pool: asyncpg.Pool, redis_client,
             return await _exec_revoke_silence(pool, redis_client, payload, approved_by)
         elif action_type == ACTION_SET_SETTING:
             return await _exec_set_setting(pool, redis_client, payload, approved_by)
+        elif action_type == ACTION_CREATE_FEEDBACK_RULE:
+            return await _exec_create_feedback_rule(pool, redis_client, payload)
         elif action_type == ACTION_CUSTOM:
             # Custom actions are recorded but not auto-executed
             return {"ok": True, "note": "Custom action logged. Manual intervention required."}
@@ -482,6 +486,58 @@ async def _exec_revoke_silence(pool, redis_client, payload, approved_by):
     return {"ok": ok, "silence_id": sid}
 
 
+async def _exec_create_feedback_rule(pool, redis_client, payload):
+    """
+    Insert one or more event_feedback rows so the processor starts filtering
+    matching events as 'ignore' or 'important'.
+
+    payload schema:
+      {
+        "rules": [
+          {
+            "verdict":  "ignore" | "important",
+            "host":     "<hostname or empty string for any host>",
+            "program":  "<program/tag or empty for any>",
+            "pattern":  "<substring of the log message, or empty for host-wide>"
+          }
+        ]
+      }
+    """
+    rules = payload.get("rules", [])
+    if not rules:
+        return {"ok": False, "error": "No rules provided in payload"}
+
+    inserted = 0
+    async with pool.acquire() as conn:
+        for r in rules:
+            verdict = r.get("verdict", "ignore")
+            if verdict not in ("ignore", "important"):
+                continue
+            host    = (r.get("host")    or "")[:100]
+            program = (r.get("program") or "")[:100]
+            pattern = (r.get("pattern") or "")[:200]
+            if not host and not program and not pattern:
+                continue  # refuse to create an overly broad catch-all rule
+            await conn.execute(
+                """INSERT INTO event_feedback (event_id, host, program, pattern, verdict)
+                   VALUES (NULL, $1, $2, $3, $4)
+                   ON CONFLICT DO NOTHING""",
+                host, program, pattern or "*", verdict,
+            )
+            inserted += 1
+
+    # Invalidate processor signature cache so rules apply within ~1 s
+    try:
+        import json as _j
+        await redis_client.publish("loglm:feedback", _j.dumps({
+            "verdict": "feedback_rule_created", "count": inserted,
+        }))
+    except Exception:
+        pass
+
+    return {"ok": True, "inserted": inserted, "rules": rules}
+
+
 async def _exec_set_setting(pool, redis_client, payload, approved_by):
     key   = payload.get("key", "")[:100]
     value = str(payload.get("value", ""))[:500]
@@ -522,13 +578,15 @@ Detectable actions (ONLY these):
   - Acknowledge all alerts matching criteria
   - Revoke (remove) an active monitoring silence
   - Change a system setting
+  - Create a filter rule to IGNORE certain log messages (suppress noise)
+  - Create a filter rule to mark certain log messages as IMPORTANT
 
 If the user's request does NOT match any detectable action, respond normally without JSON.
 If it DOES match, respond with your explanation FOLLOWED by this exact block on its own lines:
 
 ```hitl_action
 {
-  "action_type": "<silence_host|silence_category|silence_severity|acknowledge_alerts|revoke_silence|set_setting>",
+  "action_type": "<silence_host|silence_category|silence_severity|acknowledge_alerts|revoke_silence|set_setting|create_feedback_rule>",
   "action_title": "<concise title, max 80 chars>",
   "action_desc": "<full description of what will happen, 1-3 sentences>",
   "risk_level": "<low|medium|high|critical>",
@@ -537,14 +595,41 @@ If it DOES match, respond with your explanation FOLLOWED by this exact block on 
 ```
 
 Payload schemas:
-  silence_host:     {"host": "hostname", "duration_minutes": 30, "reason": "..."}
-  silence_category: {"category": "snake_case", "duration_minutes": 30, "reason": "..."}
-  silence_severity: {"severity": "medium|low", "duration_minutes": 15, "reason": "..."}
-  acknowledge_alerts: {"category": null_or_str, "severity": null_or_str, "host": null_or_str}
-  revoke_silence:   {"silence_id": "uuid"}
-  set_setting:      {"key": "setting_name", "value": "new_value"}
+  silence_host:          {"host": "hostname", "duration_minutes": 30, "reason": "..."}
+  silence_category:      {"category": "snake_case", "duration_minutes": 30, "reason": "..."}
+  silence_severity:      {"severity": "medium|low", "duration_minutes": 15, "reason": "..."}
+  acknowledge_alerts:    {"category": null_or_str, "severity": null_or_str, "host": null_or_str}
+  revoke_silence:        {"silence_id": "uuid"}
+  set_setting:           {"key": "setting_name", "value": "new_value"}
+  create_feedback_rule:  {
+    "rules": [
+      {
+        "verdict":  "ignore",
+        "host":     "<exact hostname, or empty string for any host>",
+        "program":  "<program/service name, or empty string for any>",
+        "pattern":  "<substring that appears in matching log MESSAGES, or empty for host-wide>"
+      }
+    ]
+  }
 
-NEVER fabricate host names or silence IDs — only use values the user explicitly stated."""
+create_feedback_rule examples:
+  User: "ignore interface errors from the two APs ap-office and ap-lounge"
+  → rules: [
+      {"verdict":"ignore","host":"ap-office","program":"","pattern":"interface error"},
+      {"verdict":"ignore","host":"ap-lounge","program":"","pattern":"interface error"}
+    ]
+
+  User: "mark SSH failures on server1 as important"
+  → rules: [{"verdict":"important","host":"server1","program":"sshd","pattern":"Failed password"}]
+
+  User: "ignore all SNMP polling errors from unifi APs"
+  → rules: [
+      {"verdict":"ignore","host":"","program":"snmpd","pattern":"errors_high"},
+      {"verdict":"ignore","host":"","program":"snmpd","pattern":"interface error"}
+    ]
+
+NEVER fabricate host names, IPs, or silence IDs — only use values the user explicitly stated.
+For create_feedback_rule, the pattern must be a SUBSTRING of actual log message text, not an alert title."""
 
 
 def extract_hitl_proposal(llm_response: str) -> dict | None:

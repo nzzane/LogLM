@@ -3579,8 +3579,10 @@ async def chat_page(request: Request, session_id: str = ""):
 
 
 @app.post("/api/chat")
-async def chat_send(req: ChatRequest):
-    """Handle a chat message: gather context, call LLM, store conversation."""
+async def chat_send(req: ChatRequest, request: Request):
+    """Handle a chat message: gather context, call LLM, store conversation.
+    Automatically detects HITL action proposals in the LLM response and
+    queues them for admin approval instead of silently ignoring them."""
     if not req.message.strip():
         raise HTTPException(400, "Empty message")
 
@@ -3624,6 +3626,17 @@ async def chat_send(req: ChatRequest):
         model = OLLAMA_MODEL
         num_predict = 800
         temperature = 0.3
+
+    # Inject HITL action-detection addendum for users who can propose actions.
+    # The LLM will emit a ```hitl_action``` block when it detects an actionable
+    # request, which we extract below and queue for admin approval.
+    principal = getattr(request.state, "user", None)
+    user_can_propose = (
+        principal is not None
+        and getattr(principal, "role", "") in ops.HITL_PROPOSERS
+    )
+    if user_can_propose:
+        system_prompt = system_prompt + "\n\n" + hitl_mod.HITL_DETECTION_SYSTEM
 
     # Build prompt with conversation history
     agent_name = "LogLM Investigator" if mode == "deep" else "LogLM"
@@ -3678,7 +3691,50 @@ async def chat_send(req: ChatRequest):
     if not answer:
         answer = "I don't have enough data to answer that right now. Events may still be collecting."
 
-    # Store assistant response
+    # ── HITL proposal extraction ───────────────────────────────────────────────
+    # If the LLM included a ```hitl_action``` block, parse it, queue the action
+    # for admin approval, and strip the raw block from the displayed response
+    # (replaced by a clean card rendered on the client side).
+    hitl_proposal: dict | None = None
+    if user_can_propose:
+        proposal_data = hitl_mod.extract_hitl_proposal(answer)
+        if proposal_data:
+            try:
+                ip = auth._client_ip(request)
+                username = principal.username if principal else "chat"
+                action_id = await hitl_mod.propose_action(
+                    _pool,
+                    requested_by=username,
+                    action_type=proposal_data["action_type"],
+                    action_title=proposal_data["action_title"],
+                    action_desc=proposal_data["action_desc"],
+                    payload=proposal_data["payload"],
+                    risk_level=proposal_data.get("risk_level", hitl_mod.RISK_MEDIUM),
+                    ip=ip,
+                )
+                hitl_proposal = {
+                    "action_id":    action_id,
+                    "action_type":  proposal_data["action_type"],
+                    "action_title": proposal_data["action_title"],
+                    "action_desc":  proposal_data["action_desc"],
+                    "risk_level":   proposal_data.get("risk_level", "medium"),
+                }
+                # Publish to notify HITL page subscribers in real time
+                try:
+                    await _redis.publish("loglm:hitl", json.dumps({
+                        "event": "proposed", "action_id": action_id,
+                        "title": proposal_data["action_title"],
+                        "risk_level": proposal_data.get("risk_level"),
+                    }))
+                except Exception:
+                    pass
+            except Exception as _he:
+                print(f"[chat] HITL proposal failed: {_he}")
+
+        # Strip the raw ```hitl_action``` block from the stored/displayed answer
+        answer = hitl_mod.strip_hitl_block(answer)
+
+    # Store assistant response (clean version without raw hitl blocks)
     async with _pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, context_summary, mode) "
@@ -3692,9 +3748,10 @@ async def chat_send(req: ChatRequest):
         )
 
     return JSONResponse({
-        "session_id": str(sid),
-        "response":   answer,
-        "mode":       mode,
+        "session_id":   str(sid),
+        "response":     answer,
+        "mode":         mode,
+        "hitl_proposal": hitl_proposal,   # None when no action detected
     })
 
 
